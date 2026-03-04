@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>多云仓自动对账工具 - 完整UI演示</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Microsoft YaHei', -apple-system, BlinkMacSystemFont, sans-serif;
+        }
+        body {
+            background-color: #f0f2f5;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+        }
+        .container {
+            max-width: 1400px;
+            width: 100%;
+            background-color: white;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            color: white;
+            padding: 20px 30px;
+        }
+        .header h1 {
+            font-size: 24px;
+            margin-bottom: 5px;
+        }
+        .header p {
+            font-size: 14px;
+            opacity: 0.9;
+        }
+        .main-tabs {
+            display: flex;
+            background-color: #f8f9fa;
+            border-bottom: 2px solid #dee2e6;
+            padding: 0 20px;
+            flex-wrap: wrap;
+        }
+        .main-tab {
+            padding: 15px 25px;
+            cursor: pointer;
+            font-weight: 500;
+            color: #495057;
+            border-bottom: 3px solid transparent;
+            transition: all 0.3s;
+            font-size: 15px;
+            white-space: nowrap;
+        }
+        .main-tab.active {
+            border-bottom-color: #2a5298;
+            color: #2a5298;
+            font-weight: bold;
+            background-color: rgba(42, 82, 152, 0.05);
+        }
+        .main-tab:hover {
+            background-color: #e9ecef;
+        }
+        .content {
+            padding: 30px;
+            max-height: 800px;
+            overflow-y: auto;
+        }
+        .empty-content {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 300px;
+            background-color: #f8f9fa;
+            border-radius: 8px;
+            color: #6c757d;
+            font-size: 16px;
+            border: 2px dashed #dee2e6;
+        }
+        .section {
+            background-color: #f8f9fa;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            border: 1px solid #e9ecef;
+            overflow: hidden;
+        }
+        .section-header {
+            display: flex;
+            align-items: center;
+            padding: 15px 20px;
+            background-color: #e9ecef;
+            cursor: pointer;
+            user-select: none;
+            transition: background-color 0.2s;
+        }
+        .section-header:hover {
+            background-color: #dee2e6;
+        }
+        .section-header .toggle-icon {
+            margin-right: 10px;
+            font-size: 18px;
+            color: #2a5298;
+            transition: transform 0.3s;
+        }
+        .section-title {
+            font-size: 16px;
+            font-weight: bold;
+            color: #1e3c72;
+            flex: 1;
+        }
+        .section-badge {
+            background-color: #2a5298;
+            color: white;
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 12px;
+            margin-left: 10px;
+            font-weight: normal;
+        }
+        .section-badge-warning {
+            background-color: #ffc107;
+            color: #1e3c72;
+        }
+        .section-desc {
+            font-size: 12px;
+            color: #6c757d;
+            margin-right: 20px;
+        }
+        .section-content {
+            padding: 20px;
+            border-top: 1px solid #dee2e6;
+        }
+        .file-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        .file-label {
+            width: 120px;
+            font-weight: 500;
+            color: #495057;
+        }
+        .file-path {
+            flex: 1;
+            min-width: 300px;
+            padding: 8px 12px;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            background-color: white;
+            font-size: 14px;
+        }
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+            font-weight: 500;
+        }
+        .btn-primary {
+            background-color: #2a5298;
+            color: white;
+        }
+        .btn-primary:hover {
+            background-color: #1e3c72;
+        }
+        .btn-outline {
+            background-color: white;
+            border: 1px solid #2a5298;
+            color: #2a5298;
+        }
+        .btn-outline:hover {
+            background-color: #2a5298;
+            color: white;
+        }
+        .btn-sm {
+            padding: 5px 10px;
+            font-size: 12px;
+        }
+        .btn-success {
+            background-color: #28a745;
+            color: white;
+        }
+        .btn-success:hover {
+            background-color: #218838;
+        }
+        .select {
+            padding: 8px 12px;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            min-width: 150px;
+            background-color: white;
+        }
+        .checkbox-label {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 13px;
+            color: #495057;
+        }
+        .erp-tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .erp-tab {
+            padding: 6px 15px;
+            border-radius: 20px;
+            cursor: pointer;
+            background-color: #e9ecef;
+            color: #495057;
+            font-weight: 500;
+            font-size: 13px;
+            transition: all 0.2s;
+        }
+        .erp-tab.active {
+            background-color: #2a5298;
+            color: white;
+        }
+        .mapping-section {
+            margin-top: 15px;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        .mapping-header {
+            background-color: #e9ecef;
+            padding: 10px 15px;
+            font-weight: 500;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+        }
+        .mapping-table {
+            width: 100%;
+            border-collapse: collapse;
+            background-color: white;
+        }
+        .mapping-table th {
+            text-align: left;
+            padding: 8px 15px;
+            background-color: #f8f9fa;
+            font-weight: 500;
+            font-size: 12px;
+            border-bottom: 1px solid #dee2e6;
+        }
+        .mapping-table td {
+            padding: 6px 15px;
+            border-bottom: 1px solid #e9ecef;
+            font-size: 13px;
+        }
+        .mapping-table select {
+            width: 100%;
+            padding: 4px 8px;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        .field-required {
+            color: #dc3545;
+            margin-left: 4px;
+        }
+        .file-list {
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            background-color: white;
+            margin-bottom: 15px;
+        }
+        .file-list-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 15px;
+            border-bottom: 1px solid #dee2e6;
+        }
+        .file-list-item:last-child {
+            border-bottom: none;
+        }
+        .file-info {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        .file-name {
+            font-weight: 500;
+            font-size: 13px;
+        }
+        .file-sheet {
+            color: #6c757d;
+            font-size: 12px;
+        }
+        .preview-section {
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            overflow: hidden;
+            background-color: white;
+            margin-top: 20px;
+        }
+        .preview-header {
+            background-color: #e9ecef;
+            padding: 12px 15px;
+            font-weight: 500;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #dee2e6;
+        }
+        .preview-table-container {
+            overflow-x: auto;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .preview-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        .preview-table th {
+            background-color: #f8f9fa;
+            padding: 8px 10px;
+            text-align: left;
+            font-weight: 500;
+            position: sticky;
+            top: 0;
+            background-color: #f8f9fa;
+            border-bottom: 2px solid #dee2e6;
+            white-space: nowrap;
+        }
+        .preview-table td {
+            padding: 6px 10px;
+            border-bottom: 1px solid #e9ecef;
+            white-space: nowrap;
+        }
+        .preview-footer {
+            padding: 8px 15px;
+            background-color: #f8f9fa;
+            border-top: 1px solid #dee2e6;
+            font-size: 12px;
+            color: #6c757d;
+            display: flex;
+            justify-content: space-between;
+        }
+        .config-panel {
+            background-color: #e7f3ff;
+            border-left: 4px solid #2a5298;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 4px;
+        }
+        .config-row {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+        .flex-row {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+        .summary-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .summary-card {
+            background-color: white;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+        .summary-card-title {
+            font-size: 13px;
+            color: #6c757d;
+            margin-bottom: 5px;
+        }
+        .summary-card-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #1e3c72;
+        }
+        .action-bar {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            margin: 20px 0;
+        }
+        .btn-large {
+            padding: 10px 30px;
+            font-size: 15px;
+        }
+        .status-bar {
+            background-color: #e9ecef;
+            padding: 10px 20px;
+            border-radius: 6px;
+            font-size: 13px;
+            color: #495057;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        .status-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: #28a745;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>多云仓自动对账工具</h1>
+        <p>旺店通/云宝双系统 | 重量段+资费分离 | WPS资金流水/开票同步 | 全功能演示</p>
+    </div>
+
+    <div class="main-tabs">
+        <div class="main-tab active" onclick="switchMainTab(0)">📋 对账主流程</div>
+        <div class="main-tab" onclick="switchMainTab(1)">📊 多仓汇总回冲</div>
+        <div class="main-tab" onclick="switchMainTab(2)">📈 快递费分析</div>
+        <div class="main-tab" onclick="switchMainTab(3)">🧾 云仓账单汇总</div>
+        <div class="main-tab" onclick="switchMainTab(4)">🔄 资费转换分析</div>
+        <div class="main-tab" onclick="switchMainTab(5)">⏱️ 进度&资金&发票</div>
+    </div>
+
+    <!-- 对账主流程 -->
+    <div id="tab0" class="content" style="display: block;">
+        <div class="section">
+            <div class="section-header" onclick="toggleSection(this)">
+                <span class="toggle-icon">▼</span>
+                <span class="section-title">1. 发货明细</span>
+                <span class="section-badge">必选</span>
+            </div>
+            <div class="section-content">
+                <div class="erp-tabs">
+                    <div class="erp-tab active">📦 旺店通</div>
+                    <div class="erp-tab">☁️ 云宝</div>
+                </div>
+                <div class="file-row">
+                    <span class="file-label">文件路径：</span>
+                    <input class="file-path" value="D:\data\202503_发货明细.xlsx">
+                    <button class="btn btn-primary">浏览</button>
+                    <select class="select"><option>Sheet1</option></select>
+                    <button class="btn btn-outline">字段映射</button>
+                </div>
+                <div><label class="checkbox-label"><input type="checkbox" checked> 清洗收货省份/市</label></div>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-header" onclick="toggleSection(this)">
+                <span class="toggle-icon">▼</span>
+                <span class="section-title">2. 云宝名称货品表</span>
+                <span class="section-badge-warning">云宝专用</span>
+            </div>
+            <div class="section-content">
+                <div class="file-row">
+                    <span class="file-label">文件路径：</span>
+                    <input class="file-path" value="D:\data\云宝映射表.xlsx">
+                    <button class="btn btn-primary">浏览</button>
+                    <select class="select"><option>映射表</option></select>
+                    <button class="btn btn-outline">字段映射</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-header" onclick="toggleSection(this)">
+                <span class="toggle-icon">▼</span>
+                <span class="section-title">3. 毛重表</span>
+                <span class="section-badge">必选</span>
+            </div>
+            <div class="section-content">
+                <div class="file-row">
+                    <span class="file-label">文件路径：</span>
+                    <input class="file-path" value="D:\data\毛重表.xlsx">
+                    <button class="btn btn-primary">浏览</button>
+                    <select class="select"><option>毛重表</option></select>
+                    <button class="btn btn-outline">字段映射</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-header" onclick="toggleSection(this)">
+                <span class="toggle-icon">▼</span>
+                <span class="section-title">4. 重量段定义表</span>
+                <span class="section-badge">必选</span>
+            </div>
+            <div class="section-content">
+                <div class="file-row">
+                    <span class="file-label">文件路径：</span>
+                    <input class="file-path" value="D:\data\重量段定义.xlsx">
+                    <button class="btn btn-primary">浏览</button>
+                    <select class="select"><option>Sheet1</option></select>
+                    <button class="btn btn-outline">字段映射</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-header" onclick="toggleSection(this)">
+                <span class="toggle-icon">▼</span>
+                <span class="section-title">5. 多条件资费表</span>
+                <span class="section-badge">必选</span>
+            </div>
+            <div class="section-content">
+                <div class="file-row">
+                    <span class="file-label">文件路径：</span>
+                    <input class="file-path" value="D:\data\资费表.xlsx">
+                    <button class="btn btn-primary">浏览</button>
+                    <select class="select"><option>资费</option></select>
+                    <button class="btn btn-outline">字段映射</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-header" onclick="toggleSection(this)">
+                <span class="toggle-icon">▼</span>
+                <span class="section-title">6. 辅助数据源</span>
+            </div>
+            <div class="section-content">
+                <div class="file-row"><span class="file-label">耗材表：</span><input class="file-path" placeholder="可选"><button class="btn btn-primary btn-sm">浏览</button></div>
+                <div class="file-row"><span class="file-label">撕单表：</span><input class="file-path" placeholder="可选"><button class="btn btn-primary btn-sm">浏览</button></div>
+                <div class="file-row"><span class="file-label">售后表：</span><input class="file-path" placeholder="可选"><button class="btn btn-primary btn-sm">浏览</button></div>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-header" onclick="toggleSection(this)">
+                <span class="toggle-icon">▼</span>
+                <span class="section-title">7. 云仓账单</span>
+                <span class="section-badge">必选</span>
+            </div>
+            <div class="section-content">
+                <button class="btn btn-primary btn-sm">+ 添加账单文件</button>
+                <div class="file-list" style="margin-top:10px;">
+                    <div class="file-list-item"><span class="file-name">华东仓_账单.xlsx</span><button class="btn btn-outline btn-sm">字段映射</button></div>
+                    <div class="file-list-item"><span class="file-name">华南仓_账单.xlsx</span><button class="btn btn-outline btn-sm">字段映射</button></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-header" onclick="toggleSection(this)">
+                <span class="toggle-icon">▼</span>
+                <span class="section-title">8. 对账参数</span>
+            </div>
+            <div class="section-content">
+                <div class="flex-row">
+                    <span>重量取整方式：</span>
+                    <select class="select" style="width:120px;"><option>向上取整</option></select>
+                    <label class="checkbox-label"><input type="checkbox" checked> 启用撕单/售后扣款</label>
+                    <label class="checkbox-label"><input type="checkbox"> 启用耗材计算</label>
+                </div>
+            </div>
+        </div>
+
+        <div class="action-bar">
+            <button class="btn btn-primary btn-large">开始对账</button>
+            <button class="btn btn-outline btn-large">保存配置</button>
+            <button class="btn btn-outline btn-large">加载配置</button>
+        </div>
+        <div class="status-bar"><span class="status-indicator"></span> 就绪</div>
+    </div>
+
+    <!-- 多仓汇总回冲 -->
+    <div id="tab1" class="content" style="display: none;">
+        <div class="analysis-section">
+            <h3 class="section-title">📊 多仓快递费汇总回冲</h3>
+            <div class="file-row">
+                <span class="file-label">选择对账结果表：</span>
+                <input class="file-path" value="D:\results\">
+                <button class="btn btn-primary">添加文件</button>
+            </div>
+            <div class="file-list">
+                <div class="file-list-item"><span class="file-name">华东仓_202503_对账.xlsx (234,567行)</span><button class="btn btn-outline btn-sm">移除</button></div>
+                <div class="file-list-item"><span class="file-name">华南仓_202503_对账.xlsx (345,678行)</span><button class="btn btn-outline btn-sm">移除</button></div>
+            </div>
+            <div class="field-selector" style="margin:15px 0;">
+                <span style="font-weight:500;">选择字段：</span>
+                <div class="flex-row" style="gap:10px; flex-wrap:wrap;">
+                    <label class="checkbox-label"><input type="checkbox" checked> 物流单编号</label>
+                    <label class="checkbox-label"><input type="checkbox" checked> 店铺名称</label>
+                    <label class="checkbox-label"><input type="checkbox" checked> 地区</label>
+                    <label class="checkbox-label"><input type="checkbox" checked> 重量</label>
+                    <label class="checkbox-label"><input type="checkbox" checked> 快递费</label>
+                </div>
+            </div>
+            <div class="config-panel">
+                <div class="config-row"><span>分Sheet规则：</span><select><option>按云仓</option><option>按省份</option><option>每50万行</option></select></div>
+                <div class="config-row"><span>输出路径：</span><input class="file-path" value="D:\汇总\多仓汇总.xlsx"><button class="btn btn-primary btn-sm">浏览</button></div>
+            </div>
+            <button class="btn btn-primary">开始汇总</button>
+            <div class="preview-section" style="margin-top:20px;">
+                <div class="preview-header">预览前5行</div>
+                <div class="preview-table-container">
+                    <table class="preview-table"><thead><tr><th>物流单号</th><th>店铺</th><th>地区</th><th>重量</th><th>快递费</th></tr></thead>
+                    <tbody><tr><td>SF123</td><td>旗舰店</td><td>广东</td><td>2.0</td><td>12</td></tr></tbody></table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 快递费分析 -->
+    <div id="tab2" class="content" style="display: none;">
+        <div class="analysis-section">
+            <h3 class="section-title">📈 快递费分析</h3>
+            <div class="file-row">
+                <span class="file-label">选择云仓：</span>
+                <select><option>华东仓</option><option>华南仓</option></select>
+                <span>对账结果：华东仓_202503_对账.xlsx</span>
+            </div>
+            <div class="config-panel">
+                <div style="font-weight:500;">运营交割价配置</div>
+                <div class="flex-row" style="gap:15px;">
+                    <div>0.3kg: <input style="width:60px;" value="1.00"></div>
+                    <div>0.5kg: <input style="width:60px;" value="2.00"></div>
+                    <div>1kg: <input style="width:60px;" value="3.00"></div>
+                </div>
+            </div>
+            <button class="btn btn-primary">生成分析</button>
+            <div class="preview-section" style="margin-top:20px;">
+                <div class="preview-header">省份单量透视</div>
+                <div class="preview-table-container">
+                    <table class="preview-table"><thead><tr><th>省份</th><th>0.5kg单量</th><th>占比</th><th>1kg单量</th><th>占比</th></tr></thead>
+                    <tbody><tr><td>广东</td><td>100</td><td>20%</td><td>300</td><td>60%</td></tr></tbody></table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 云仓账单汇总 -->
+    <div id="tab3" class="content" style="display: none;">
+        <div class="analysis-section">
+            <h3 class="section-title">🧾 云仓账单汇总</h3>
+            <div class="file-row">
+                <span class="file-label">年月：</span>
+                <input type="month" value="2025-03">
+                <span>云仓：</span>
+                <select multiple size="3" style="height:80px;">
+                    <option selected>华东仓</option>
+                    <option selected>华南仓</option>
+                    <option>华北仓</option>
+                </select>
+            </div>
+            <div class="file-row">
+                <span class="file-label">对账结果：</span>
+                <input class="file-path" value="D:\results\">
+                <button class="btn btn-primary btn-sm">添加文件</button>
+            </div>
+            <div class="config-panel">
+                <div style="font-weight:500; margin-bottom:10px;">WPS在线文档同步</div>
+                <div class="file-row">
+                    <span class="file-label">API配置：</span>
+                    <input placeholder="API Key" style="width:150px;"> <input placeholder="Secret" style="width:150px;">
+                    <button class="btn btn-outline btn-sm">验证</button>
+                </div>
+                <div class="file-row">
+                    <span class="file-label">资金流水文档ID：</span>
+                    <input value="abcd1234" style="width:200px;">
+                    <button class="btn btn-outline btn-sm">读取</button>
+                </div>
+                <div class="file-row">
+                    <span class="file-label">开票进度文档ID：</span>
+                    <input value="efgh5678" style="width:200px;">
+                    <button class="btn btn-outline btn-sm">读取</button>
+                </div>
+                <div><label class="checkbox-label"><input type="checkbox" checked> 同步后自动生成账单</label></div>
+            </div>
+            <button class="btn btn-primary">生成账单</button>
+            <div class="preview-section" style="margin-top:20px;">
+                <div class="preview-header">账单预览</div>
+                <div class="preview-table-container">
+                    <table class="preview-table">
+                        <thead><tr><th>云仓</th><th>期初</th><th>快递费</th><th>耗材</th><th>撕单</th><th>售后</th><th>预充</th><th>调整</th><th>应付</th><th>期末</th><th>已开票</th></tr></thead>
+                        <tbody><tr><td>华东仓</td><td>5000</td><td>12345</td><td>890</td><td>200</td><td>150</td><td>10000</td><td>0</td><td>12885</td><td>2115</td><td>8000</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 资费转换分析 -->
+    <div id="tab4" class="content" style="display: none;">
+        <div class="analysis-section">
+            <h3 class="section-title">🔄 资费转换和分析</h3>
+            <div style="display:flex; gap:30px;">
+                <div style="flex:1;">
+                    <h4>二维表转一维表</h4>
+                    <div class="file-row"><span>文件：</span><input class="file-path"><button class="btn btn-primary">上传</button></div>
+                    <div><button class="btn btn-success">转换</button> <button class="btn btn-outline">预览</button></div>
+                    <div class="preview-section" style="margin-top:10px;">
+                        <div class="preview-header">转换结果</div>
+                        <div class="preview-table-container">
+                            <table class="preview-table"><thead><tr><th>云仓</th><th>地区</th><th>重量段</th><th>价格</th></tr></thead>
+                            <tbody><tr><td>华东仓</td><td>广东</td><td>1</td><td>8</td></tr></tbody></table>
+                        </div>
+                    </div>
+                </div>
+                <div style="flex:1;">
+                    <h4>资费查询</h4>
+                    <div class="file-row"><span>资费表：</span><input class="file-path" value="D:\data\资费表.xlsx"></div>
+                    <div class="config-panel">
+                        <div>省份：<select><option>全部</option><option>广东</option></select></div>
+                        <div>结算重量：<input style="width:80px;" value="2.5"></div>
+                        <div>云仓：<select><option>全部</option><option>华东仓</option></select></div>
+                        <div>是否打包品：<select><option>全部</option><option>是</option></select></div>
+                        <div>生效日期：<input type="date" value="2025-03-01"> 至 <input type="date" value="2025-03-31"></div>
+                        <label><input type="checkbox" checked> 仅当前有效</label>
+                    </div>
+                    <button class="btn btn-primary">查询</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 预留选项卡 -->
+    <div id="tab5" class="content" style="display: none;">
+        <div class="empty-content">⏱️ 对账进度&资金&发票 - 预留功能</div>
+    </div>
+
+    <div class="status-bar" style="margin-top:0; border-top:1px solid #dee2e6; border-radius:0;">
+        <span class="status-indicator"></span> 演示模式 - 所有控件均为静态示意
+    </div>
+</div>
+
+<script>
+    function toggleSection(header) {
+        const icon = header.querySelector('.toggle-icon');
+        const content = header.nextElementSibling;
+        if (content.style.display === 'none') {
+            content.style.display = 'block';
+            icon.textContent = '▼';
+        } else {
+            content.style.display = 'none';
+            icon.textContent = '►';
+        }
+    }
+    function switchMainTab(index) {
+        document.querySelectorAll('.main-tab').forEach((tab, i) => {
+            tab.classList.toggle('active', i === index);
+        });
+        for (let i = 0; i <= 5; i++) {
+            const el = document.getElementById('tab' + i);
+            if (el) el.style.display = i === index ? 'block' : 'none';
+        }
+    }
+    // 初始展开所有章节
+    window.onload = function() {
+        document.querySelectorAll('.section-content').forEach(c => c.style.display = 'block');
+    };
+</script>
+</body>
+</html>

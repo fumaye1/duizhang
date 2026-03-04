@@ -1,0 +1,168 @@
+<!-- 快递费分析 -->
+<div id="tab2" class="content" style="display: none;">
+    <div class="analysis-section">
+        <div class="section-title">📈 快递费分析</div>
+        
+        <!-- 云仓选择 -->
+        <div class="file-row">
+            <span class="file-label">选择云仓：</span>
+            <select class="select" style="width: 200px;">
+                <option>华东仓</option>
+                <option>华南仓</option>
+                <option selected>华北仓</option>
+                <option>西南仓</option>
+            </select>
+            <span style="color: #6c757d;">当前选择: 华北仓 (276,187行)</span>
+        </div>
+        
+        <!-- 运营交割价配置 -->
+        <div class="config-panel">
+            <div style="font-weight: 500; margin-bottom: 15px;">⚙️ 运营交割价配置</div>
+            <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 15px;">
+                <div><label style="display: block; font-size: 12px; color: #6c757d;">0.3kg以内</label><input type="text" style="width: 100%; padding: 5px;" value="1.00"></div>
+                <div><label style="display: block; font-size: 12px; color: #6c757d;">0.5kg以内</label><input type="text" style="width: 100%; padding: 5px;" value="2.00"></div>
+                <div><label style="display: block; font-size: 12px; color: #6c757d;">1kg以内</label><input type="text" style="width: 100%; padding: 5px;" value="3.00"></div>
+                <div><label style="display: block; font-size: 12px; color: #6c757d;">2kg以内</label><input type="text" style="width: 100%; padding: 5px;" value="5.00"></div>
+                <div><label style="display: block; font-size: 12px; color: #6c757d;">3kg以内</label><input type="text" style="width: 100%; padding: 5px;" value="7.00"></div>
+            </div>
+            <div style="margin-top: 10px; font-size: 12px; color: #6c757d;">格式: 重量区间上限 : 价格，支持小数</div>
+        </div>
+        
+        <!-- 操作按钮 -->
+        <div style="display: flex; gap: 15px; margin: 20px 0;">
+            <button class="btn btn-primary">生成分析报表</button>
+            <button class="btn btn-outline">导出Excel</button>
+        </div>
+        
+        <!-- ===== 1. 各省份单量及占比（透视表格式） ===== -->
+        <div class="subsection-title">📊 各省份单量及占比（按结算重量取整）</div>
+        <div class="table-container" style="overflow-x: auto;">
+            <table class="data-table pivot-table" style="min-width: 1000px;">
+                <thead>
+                    <tr>
+                        <th rowspan="2">省份</th>
+                        <th colspan="2">0.5kg</th>
+                        <th colspan="2">1kg</th>
+                        <th colspan="2">2kg</th>
+                        <th colspan="2">3kg</th>
+                        <th colspan="2">4kg</th>
+                        <th colspan="2">5kg+</th>
+                        <th rowspan="2">合计单量</th>
+                    </tr>
+                    <tr>
+                        <th>单量</th><th>占比</th>
+                        <th>单量</th><th>占比</th>
+                        <th>单量</th><th>占比</th>
+                        <th>单量</th><th>占比</th>
+                        <th>单量</th><th>占比</th>
+                        <th>单量</th><th>占比</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>广东省</td>
+                        <td>8,234</td><td>18.0%</td>
+                        <td>12,345</td><td>27.0%</td>
+                        <td>10,456</td><td>22.9%</td>
+                        <td>6,789</td><td>14.9%</td>
+                        <td>4,321</td><td>9.5%</td>
+                        <td>3,533</td><td>7.7%</td>
+                        <td>45,678</td>
+                    </tr>
+                    <tr>
+                        <td>浙江省</td>
+                        <td>7,801</td><td>20.1%</td>
+                        <td>10,234</td><td>26.3%</td>
+                        <td>8,567</td><td>22.0%</td>
+                        <td>5,678</td><td>14.6%</td>
+                        <td>3,456</td><td>8.9%</td>
+                        <td>3,165</td><td>8.1%</td>
+                        <td>38,901</td>
+                    </tr>
+                    <tr>
+                        <td>江苏省</td>
+                        <td>6,234</td><td>17.5%</td>
+                        <td>9,876</td><td>27.7%</td>
+                        <td>7,890</td><td>22.1%</td>
+                        <td>5,123</td><td>14.4%</td>
+                        <td>3,210</td><td>9.0%</td>
+                        <td>3,345</td><td>9.4%</td>
+                        <td>35,678</td>
+                    </tr>
+                    <tr>
+                        <td>上海市</td>
+                        <td>5,432</td><td>18.8%</td>
+                        <td>7,654</td><td>26.5%</td>
+                        <td>6,321</td><td>21.9%</td>
+                        <td>4,567</td><td>15.8%</td>
+                        <td>2,789</td><td>9.7%</td>
+                        <td>2,138</td><td>7.4%</td>
+                        <td>28,901</td>
+                    </tr>
+                    <tr>
+                        <td>北京市</td>
+                        <td>4,321</td><td>16.8%</td>
+                        <td>6,543</td><td>25.5%</td>
+                        <td>5,678</td><td>22.1%</td>
+                        <td>4,123</td><td>16.1%</td>
+                        <td>2,456</td><td>9.6%</td>
+                        <td>2,557</td><td>10.0%</td>
+                        <td>25,678</td>
+                    </tr>
+                    <tr class="total-row">
+                        <td>合计</td>
+                        <td>32,022</td><td>11.6%</td>
+                        <td>46,652</td><td>16.9%</td>
+                        <td>38,912</td><td>14.1%</td>
+                        <td>26,280</td><td>9.5%</td>
+                        <td>16,232</td><td>5.9%</td>
+                        <td>14,738</td><td>5.3%</td>
+                        <td>276,187</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <!-- 说明：占比为该重量档位单量占该省份总单量的百分比 -->
+        
+        <!-- ===== 后续分析表格保持不变 ===== -->
+        <!-- 2. 单量TOP单品 -->
+        <div class="subsection-title">🏆 单量TOP单品</div>
+        <div class="table-container">
+            <table class="data-table">
+                <thead><tr><th>排名</th><th>商家编码</th><th>单量</th><th>快递费总额</th><th>平均单价</th><th>运营交割价</th><th>(平均单价-运营交割价)*单量</th></tr></thead>
+                <tbody>
+                    <tr><td>1</td><td>SKU001234</td><td>12,345</td><td>61,725</td><td>5.00</td><td>4.50</td><td style="color: #28a745;">+6,172.5</td></tr>
+                    <tr><td>2</td><td>SKU005678</td><td>11,234</td><td>56,170</td><td>5.00</td><td>4.80</td><td style="color: #28a745;">+2,246.8</td></tr>
+                    <tr><td>3</td><td>SKU009012</td><td>10,123</td><td>50,615</td><td>5.00</td><td>5.20</td><td style="color: #dc3545;">-2,024.6</td></tr>
+                    <tr><td>4</td><td>SKU003456</td><td>9,876</td><td>49,380</td><td>5.00</td><td>5.00</td><td style="color: #6c757d;">0.00</td></tr>
+                    <tr><td>5</td><td>SKU007890</td><td>8,765</td><td>43,825</td><td>5.00</td><td>4.70</td><td style="color: #28a745;">+2,629.5</td></tr>
+                </tbody>
+            </table>
+        </div>
+        
+        <!-- 3. 结算重量平均单价表 -->
+        <div class="subsection-title">⚖️ 结算重量平均单价表</div>
+        <div class="table-container">
+            <table class="data-table">
+                <thead><tr><th>结算重量(取整)</th><th>单量</th><th>快递费汇总</th><th>平均单价</th><th>运营交割价</th><th>(平均单价-运营交割价)*单量</th></tr></thead>
+                <tbody>
+                    <tr><td>0.5</td><td>45,678</td><td>91,356</td><td>2.00</td><td>2.00</td><td>0.00</td></tr>
+                    <tr><td>1.0</td><td>78,901</td><td>236,703</td><td>3.00</td><td>3.00</td><td>0.00</td></tr>
+                    <tr><td>2.0</td><td>56,789</td><td>283,945</td><td>5.00</td><td>5.00</td><td>0.00</td></tr>
+                    <tr><td>3.0</td><td>34,567</td><td>242,969</td><td>7.03</td><td>7.00</td><td style="color: #28a745;">+1,038.3</td></tr>
+                    <tr><td>4.0</td><td>23,456</td><td>187,648</td><td>8.00</td><td>7.80</td><td style="color: #28a745;">+4,691.2</td></tr>
+                    <tr><td>5.0</td><td>12,345</td><td>110,582</td><td>8.96</td><td>8.50</td><td style="color: #28a745;">+5,678.7</td></tr>
+                    <tr class="total-row"><td>合计</td><td>276,187</td><td>1,153,203</td><td>4.18</td><td>-</td><td>+11,408.2</td></tr>
+                </tbody>
+            </table>
+        </div>
+        
+        <!-- 分析结论卡片 -->
+        <div class="cards-container">
+            <div class="card"><div class="card-title">总单量</div><div class="card-value">276,187</div><div class="card-desc">较上月 +5.2%</div></div>
+            <div class="card"><div class="card-title">总快递费</div><div class="card-value">¥2,761,870</div><div class="card-desc">平均单价 ¥10.00</div></div>
+            <div class="card"><div class="card-title">运营差价</div><div class="card-value" style="color: #28a745;">+¥11,408</div><div class="card-desc">高于运营价</div></div>
+            <div class="card"><div class="card-title">TOP单品</div><div class="card-value">SKU001234</div><div class="card-desc">单量 12,345</div></div>
+        </div>
+    </div>
+</div>
