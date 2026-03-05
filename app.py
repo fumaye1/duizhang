@@ -23,6 +23,9 @@ from analysis_module import (
     parse_price_rules,
 )
 
+from bill_summary_module import BillLineItem, build_summary_bill
+from wps_http_client import HttpMetricConfig, fetch_metric
+
 
 st.set_page_config(page_title="多云仓自动对账工具", layout="wide")
 
@@ -259,8 +262,8 @@ def main():
     st.title("多云仓自动对账工具 - 主对账 MVP")
     st.caption("固定字段名版本（MVP），按PRD主流程实现")
 
-    tab_reconcile, tab_multi, tab_analysis = st.tabs(
-        ["📋 对账主流程", "📦 多仓汇总与回冲", "📊 快递费分析"]
+    tab_reconcile, tab_multi, tab_analysis, tab_bill = st.tabs(
+        ["📋 对账主流程", "📦 多仓汇总与回冲", "📊 快递费分析", "🧾 汇总账单"]
     )
 
     with tab_reconcile:
@@ -779,129 +782,355 @@ def main():
             "analysis_file",
         )
         if not analysis_bytes or not analysis_sheet:
-            return
+            st.info("请先上传对账结果表")
+            analysis_df = None
+        else:
+            analysis_df = read_df(analysis_bytes, analysis_sheet)
 
-        analysis_df = read_df(analysis_bytes, analysis_sheet)
         if analysis_df is None or analysis_df.empty:
-            st.error("对账结果表为空，请检查所选 Sheet")
+            if analysis_bytes and analysis_sheet:
+                st.error("对账结果表为空，请检查所选 Sheet")
+        else:
+            st.subheader("字段选择")
+            col_left, col_right = st.columns([1, 1])
+            with col_left:
+                order_col = st.selectbox(
+                    "订单唯一标识列",
+                    options=analysis_cols,
+                    index=analysis_cols.index("物流单号") if "物流单号" in analysis_cols else 0,
+                    key="analysis_order_col",
+                )
+                province_col = st.selectbox(
+                    "省份列",
+                    options=analysis_cols,
+                    index=analysis_cols.index("收货省份") if "收货省份" in analysis_cols else 0,
+                    key="analysis_province_col",
+                )
+                sku_col = st.selectbox(
+                    "单品列",
+                    options=analysis_cols,
+                    index=analysis_cols.index("商家编码") if "商家编码" in analysis_cols else 0,
+                    key="analysis_sku_col",
+                )
+            with col_right:
+                weight_col = st.selectbox(
+                    "重量列",
+                    options=analysis_cols,
+                    index=analysis_cols.index("结算重量(取整)") if "结算重量(取整)" in analysis_cols else 0,
+                    key="analysis_weight_col",
+                )
+                fee_candidates = ["账单快递费", "快递费(核算后)", "应付金额", "账单运费", "理论运费"]
+                fee_default = next((c for c in fee_candidates if c in analysis_cols), analysis_cols[0])
+                fee_col = st.selectbox(
+                    "快递费列（用于统计）",
+                    options=analysis_cols,
+                    index=analysis_cols.index(fee_default) if fee_default in analysis_cols else 0,
+                    key="analysis_fee_col",
+                )
+
+            st.subheader("运营交割价配置")
+            st.caption("填写“重量上限(kg) -> 运营交割价(元)”。未配置时将不计算差价相关字段。")
+            config_init = pd.DataFrame(
+                [
+                    {"重量上限(kg)": pd.NA, "运营交割价(元)": pd.NA},
+                ]
+            )
+            config_df = st.data_editor(
+                config_init,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="analysis_price_config",
+            )
+            rules = parse_price_rules(config_df)
+
+            top_n = st.number_input(
+                "TOP 单品数量",
+                min_value=1,
+                value=50,
+                step=10,
+                key="analysis_top_n",
+            )
+
+            if st.button("生成分析", type="primary", key="analysis_run"):
+                missing = [
+                    c
+                    for c in [order_col, province_col, sku_col, weight_col, fee_col]
+                    if c not in analysis_df.columns
+                ]
+                if missing:
+                    st.error(f"对账结果表缺少列：{'、'.join(missing)}")
+                else:
+                    with st.spinner("正在生成分析结果..."):
+                        pivot_count, pivot_share = compute_province_pivot(
+                            analysis_df,
+                            province_col=province_col,
+                            weight_col=weight_col,
+                            order_col=order_col,
+                        )
+                        top_sku_df = compute_top_skus(
+                            analysis_df,
+                            sku_col=sku_col,
+                            weight_col=weight_col,
+                            fee_col=fee_col,
+                            order_col=order_col,
+                            rules=rules,
+                            top_n=int(top_n),
+                        )
+                        weight_price_df = compute_weight_price_table(
+                            analysis_df,
+                            weight_col=weight_col,
+                            fee_col=fee_col,
+                            order_col=order_col,
+                            rules=rules,
+                        )
+
+                    st.subheader("省份透视（单量）")
+                    st.dataframe(pivot_count, use_container_width=True)
+                    st.subheader("省份透视（占比）")
+                    st.dataframe(pivot_share, use_container_width=True)
+                    st.subheader("TOP 单品")
+                    st.dataframe(top_sku_df, use_container_width=True)
+                    st.subheader("重量单价表")
+                    st.dataframe(weight_price_df, use_container_width=True)
+
+                    output = io.BytesIO()
+                    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                        pivot_count.to_excel(writer, sheet_name="省份透视_单量", index=False)
+                        pivot_share.to_excel(writer, sheet_name="省份透视_占比", index=False)
+                        top_sku_df.to_excel(writer, sheet_name="TOP单品", index=False)
+                        weight_price_df.to_excel(writer, sheet_name="重量单价", index=False)
+
+                    st.download_button(
+                        label="下载分析Excel",
+                        data=output.getvalue(),
+                        file_name="快递费分析.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="analysis_download",
+                    )
+
+    with tab_bill:
+        st.subheader("汇总账单")
+        st.caption(
+            "根据结果表生成汇总账单（序号/项目/金额/余额）。期初余额与本月预充支持手动输入或从WPS多维表API获取。"
+        )
+
+        bill_bytes, bill_sheet, bill_cols = file_uploader_block(
+            "结果表（单文件，可选任意Sheet）",
+            "bill_summary_file",
+        )
+        if not bill_bytes or not bill_sheet:
+            st.info("请先上传结果表")
             return
 
-        st.subheader("字段选择")
-        col_left, col_right = st.columns([1, 1])
-        with col_left:
-            order_col = st.selectbox(
-                "订单唯一标识列",
-                options=analysis_cols,
-                index=analysis_cols.index("物流单号") if "物流单号" in analysis_cols else 0,
-                key="analysis_order_col",
-            )
-            province_col = st.selectbox(
-                "省份列",
-                options=analysis_cols,
-                index=analysis_cols.index("收货省份") if "收货省份" in analysis_cols else 0,
-                key="analysis_province_col",
-            )
-            sku_col = st.selectbox(
-                "单品列",
-                options=analysis_cols,
-                index=analysis_cols.index("商家编码") if "商家编码" in analysis_cols else 0,
-                key="analysis_sku_col",
-            )
-        with col_right:
-            weight_col = st.selectbox(
-                "重量列",
-                options=analysis_cols,
-                index=analysis_cols.index("结算重量(取整)") if "结算重量(取整)" in analysis_cols else 0,
-                key="analysis_weight_col",
-            )
-            fee_candidates = ["账单快递费", "快递费(核算后)", "应付金额", "账单运费", "理论运费"]
-            fee_default = next((c for c in fee_candidates if c in analysis_cols), analysis_cols[0])
-            fee_col = st.selectbox(
-                "快递费列（用于统计）",
-                options=analysis_cols,
-                index=analysis_cols.index(fee_default) if fee_default in analysis_cols else 0,
-                key="analysis_fee_col",
-            )
+        result_df = read_df(bill_bytes, bill_sheet)
+        if result_df is None or result_df.empty:
+            st.error("结果表为空，请检查所选 Sheet")
+            return
 
-        st.subheader("运营交割价配置")
-        st.caption("填写“重量上限(kg) -> 运营交割价(元)”。未配置时将不计算差价相关字段。")
-        config_init = pd.DataFrame(
+        st.subheader("1) 期初余额")
+        opening_mode = st.radio(
+            "期初余额来源",
+            options=["手动输入", "从WPS多维表API获取"],
+            horizontal=True,
+            key="bill_opening_mode",
+        )
+        opening_balance: float = 0.0
+
+        if opening_mode == "手动输入":
+            opening_balance = float(
+                st.number_input(
+                    "期初余额",
+                    value=float(st.session_state.get("bill_opening_balance", 0.0)),
+                    step=100.0,
+                    key="bill_opening_balance",
+                )
+            )
+        else:
+            st.caption("说明：这里提供通用HTTP取数配置。将WPS多维表接口的请求参数粘贴进来即可。")
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                opening_url = st.text_input("请求URL", key="bill_opening_url")
+                opening_method = st.selectbox("请求方法", options=["GET", "POST"], key="bill_opening_method")
+                opening_value_path = st.text_input(
+                    "取值路径 value_path（例：data.items[0].amount）",
+                    value="value",
+                    key="bill_opening_value_path",
+                )
+            with col2:
+                opening_headers = st.text_area(
+                    "请求Headers(JSON对象)",
+                    value=st.session_state.get("bill_opening_headers", "{}"),
+                    height=120,
+                    key="bill_opening_headers",
+                )
+                opening_body = st.text_area(
+                    "请求参数/Body(JSON对象；GET为query参数，POST为json body)",
+                    value=st.session_state.get("bill_opening_body", "{}"),
+                    height=120,
+                    key="bill_opening_body",
+                )
+
+            if st.button("获取期初余额", type="secondary", key="bill_fetch_opening"):
+                try:
+                    cfg = HttpMetricConfig(
+                        method=str(opening_method),
+                        url=str(opening_url),
+                        headers_json=str(opening_headers),
+                        body_json=str(opening_body),
+                        value_path=str(opening_value_path),
+                    )
+                    value = fetch_metric(cfg)
+                    st.session_state["bill_opening_balance"] = float(value)
+                    st.success(f"已获取期初余额：{value}")
+                except Exception as e:
+                    st.error(f"获取期初余额失败：{e}")
+
+            opening_balance = float(st.session_state.get("bill_opening_balance", 0.0))
+
+        st.subheader("2) 选择项目（从结果表字段合计）")
+        sum_candidates = [
+            "账单快递费",
+            "快递费(核算后)",
+            "耗材费",
+            "加收费",
+            "应付金额",
+            "差异金额",
+        ]
+        default_sum_cols = [c for c in sum_candidates if c in bill_cols]
+        selected_sum_cols = st.multiselect(
+            "选择需要合计的字段（可多选）",
+            options=bill_cols,
+            default=default_sum_cols,
+            key="bill_sum_cols",
+        )
+
+        items_init = pd.DataFrame(
             [
-                {"重量上限(kg)": pd.NA, "运营交割价(元)": pd.NA},
+                {
+                    "项目": col,
+                    "来源列": col,
+                    "系数": 1.0,
+                }
+                for col in selected_sum_cols
             ]
         )
-        config_df = st.data_editor(
-            config_init,
-            num_rows="dynamic",
+        items_df = st.data_editor(
+            items_init,
             use_container_width=True,
-            key="analysis_price_config",
-        )
-        rules = parse_price_rules(config_df)
-
-        top_n = st.number_input(
-            "TOP 单品数量",
-            min_value=1,
-            value=50,
-            step=10,
-            key="analysis_top_n",
+            hide_index=True,
+            disabled=["来源列"],
+            key="bill_items_editor",
         )
 
-        if st.button("生成分析", type="primary", key="analysis_run"):
-            missing = [
-                c
-                for c in [order_col, province_col, sku_col, weight_col, fee_col]
-                if c not in analysis_df.columns
-            ]
-            if missing:
-                st.error(f"对账结果表缺少列：{'、'.join(missing)}")
+        st.subheader("3) 本月预充")
+        prepaid_mode = st.radio(
+            "本月预充来源",
+            options=["手动输入", "从WPS多维表API获取"],
+            horizontal=True,
+            key="bill_prepaid_mode",
+        )
+        prepaid_amount: float = 0.0
+        if prepaid_mode == "手动输入":
+            prepaid_amount_input = float(
+                st.number_input(
+                    "本月预充金额（输入正数，系统按 -1 系数计入）",
+                    value=float(st.session_state.get("bill_prepaid_amount", 0.0)),
+                    step=100.0,
+                    key="bill_prepaid_amount",
+                )
+            )
+            prepaid_amount = -abs(prepaid_amount_input)
+        else:
+            st.caption("说明：同上，使用通用HTTP取数配置拉取本月预充金额。")
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                prepaid_url = st.text_input("请求URL", key="bill_prepaid_url")
+                prepaid_method = st.selectbox("请求方法", options=["GET", "POST"], key="bill_prepaid_method")
+                prepaid_value_path = st.text_input(
+                    "取值路径 value_path（例：data.items[0].amount）",
+                    value="value",
+                    key="bill_prepaid_value_path",
+                )
+            with col2:
+                prepaid_headers = st.text_area(
+                    "请求Headers(JSON对象)",
+                    value=st.session_state.get("bill_prepaid_headers", "{}"),
+                    height=120,
+                    key="bill_prepaid_headers",
+                )
+                prepaid_body = st.text_area(
+                    "请求参数/Body(JSON对象；GET为query参数，POST为json body)",
+                    value=st.session_state.get("bill_prepaid_body", "{}"),
+                    height=120,
+                    key="bill_prepaid_body",
+                )
+
+            if st.button("获取本月预充金额", type="secondary", key="bill_fetch_prepaid"):
+                try:
+                    cfg = HttpMetricConfig(
+                        method=str(prepaid_method),
+                        url=str(prepaid_url),
+                        headers_json=str(prepaid_headers),
+                        body_json=str(prepaid_body),
+                        value_path=str(prepaid_value_path),
+                    )
+                    value = fetch_metric(cfg)
+                    st.session_state["bill_prepaid_amount"] = float(value)
+                    st.success(f"已获取本月预充金额：{value}")
+                except Exception as e:
+                    st.error(f"获取本月预充金额失败：{e}")
+
+            prepaid_amount = -abs(float(st.session_state.get("bill_prepaid_amount", 0.0)))
+
+        st.divider()
+
+        if st.button("生成汇总账单", type="primary", key="bill_build"):
+            if not isinstance(items_df, pd.DataFrame) or items_df.empty:
+                st.error("请先选择至少 1 个需要合计的字段")
+                return
+            if "来源列" not in items_df.columns or "项目" not in items_df.columns or "系数" not in items_df.columns:
+                st.error("项目配置表结构异常，请重新选择字段")
                 return
 
-            with st.spinner("正在生成分析结果..."):
-                pivot_count, pivot_share = compute_province_pivot(
-                    analysis_df,
-                    province_col=province_col,
-                    weight_col=weight_col,
-                    order_col=order_col,
-                )
-                top_sku_df = compute_top_skus(
-                    analysis_df,
-                    sku_col=sku_col,
-                    weight_col=weight_col,
-                    fee_col=fee_col,
-                    order_col=order_col,
-                    rules=rules,
-                    top_n=int(top_n),
-                )
-                weight_price_df = compute_weight_price_table(
-                    analysis_df,
-                    weight_col=weight_col,
-                    fee_col=fee_col,
-                    order_col=order_col,
-                    rules=rules,
+            line_items: List[BillLineItem] = []
+            for _, row in items_df.iterrows():
+                project = str(row.get("项目") or "").strip()
+                source_col = str(row.get("来源列") or "").strip()
+                multiplier = row.get("系数")
+                if not project or not source_col:
+                    continue
+                try:
+                    multiplier_f = float(multiplier)
+                except Exception:
+                    multiplier_f = 1.0
+                line_items.append(
+                    BillLineItem(project=project, source_column=source_col, multiplier=multiplier_f)
                 )
 
-            st.subheader("省份透视（单量）")
-            st.dataframe(pivot_count, use_container_width=True)
-            st.subheader("省份透视（占比）")
-            st.dataframe(pivot_share, use_container_width=True)
-            st.subheader("TOP 单品")
-            st.dataframe(top_sku_df, use_container_width=True)
-            st.subheader("重量单价表")
-            st.dataframe(weight_price_df, use_container_width=True)
+            if not line_items:
+                st.error("请至少保留 1 行有效的项目配置")
+                return
+
+            bill_df = build_summary_bill(
+                result_df=result_df,
+                opening_balance=float(opening_balance),
+                line_items=line_items,
+                prepaid_amount=float(prepaid_amount),
+            )
+
+            st.subheader("汇总账单预览")
+            st.dataframe(bill_df, use_container_width=True)
 
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                pivot_count.to_excel(writer, sheet_name="省份透视_单量", index=False)
-                pivot_share.to_excel(writer, sheet_name="省份透视_占比", index=False)
-                top_sku_df.to_excel(writer, sheet_name="TOP单品", index=False)
-                weight_price_df.to_excel(writer, sheet_name="重量单价", index=False)
+                bill_df.to_excel(writer, sheet_name="汇总账单", index=False)
 
             st.download_button(
-                label="下载分析Excel",
+                label="下载汇总账单Excel",
                 data=output.getvalue(),
-                file_name="快递费分析.xlsx",
+                file_name="汇总账单.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="analysis_download",
+                key="bill_download",
             )
 
 
