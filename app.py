@@ -16,6 +16,13 @@ from reconcile import (
     validate_columns,
 )
 
+from analysis_module import (
+    compute_province_pivot,
+    compute_top_skus,
+    compute_weight_price_table,
+    parse_price_rules,
+)
+
 
 st.set_page_config(page_title="多云仓自动对账工具", layout="wide")
 
@@ -82,6 +89,91 @@ def read_and_map_multi(
     if not dfs:
         return None
     return pd.concat(dfs, ignore_index=True)
+
+
+def read_multi_excel(items: List[Tuple[bytes, str]]) -> Optional[pd.DataFrame]:
+    if not items:
+        return None
+    dfs: List[pd.DataFrame] = []
+    for file_bytes, sheet in items:
+        dfs.append(load_excel(file_bytes, sheet))
+    if not dfs:
+        return None
+    return pd.concat(dfs, ignore_index=True)
+
+
+def ensure_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    df = df.copy()
+    for col in cols:
+        if col not in df.columns:
+            df[col] = pd.NA
+    return df
+
+
+def aggregate_by_key_sum(df: pd.DataFrame, key_col: str, value_cols: List[str]) -> pd.DataFrame:
+    if df.empty:
+        return df
+    work = df.copy()
+    work[key_col] = work[key_col].astype(str)
+    for col in value_cols:
+        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0)
+    out = work.groupby([key_col], dropna=False)[value_cols].sum().reset_index()
+    return out
+
+
+def excel_safe_sheet_name(name: str) -> str:
+    text = str(name or "").strip() or "Sheet"
+    for ch in [":", "\\", "/", "?", "*", "[", "]"]:
+        text = text.replace(ch, "_")
+    return text[:31]
+
+
+def split_by_warehouse_and_threshold(
+    df: pd.DataFrame,
+    warehouse_col: str,
+    max_rows: int,
+) -> List[Tuple[str, pd.DataFrame]]:
+    if df.empty:
+        return [("多仓汇总", df)]
+
+    if max_rows <= 0:
+        max_rows = 800_000
+
+    if len(df) <= max_rows:
+        return [("多仓汇总", df)]
+
+    if warehouse_col not in df.columns:
+        raise ValueError(f"缺少列：{warehouse_col}，无法按仓分页")
+
+    sheets: List[Tuple[str, pd.DataFrame]] = []
+    for wh_value, wh_df in df.groupby(warehouse_col, dropna=False, sort=False):
+        wh_name = excel_safe_sheet_name(str(wh_value) if pd.notna(wh_value) else "未知仓")
+        wh_df = wh_df.copy()
+        if len(wh_df) <= max_rows:
+            sheets.append((wh_name, wh_df))
+            continue
+
+        # Chunk within a warehouse if it still exceeds the threshold.
+        num_chunks = int((len(wh_df) + max_rows - 1) / max_rows)
+        for idx in range(num_chunks):
+            start = idx * max_rows
+            end = min((idx + 1) * max_rows, len(wh_df))
+            chunk = wh_df.iloc[start:end].copy()
+            sheet_name = excel_safe_sheet_name(f"{wh_name}_{idx + 1}")
+            sheets.append((sheet_name, chunk))
+
+    # Ensure sheet names are unique.
+    used: set[str] = set()
+    unique_sheets: List[Tuple[str, pd.DataFrame]] = []
+    for name, sdf in sheets:
+        base = name
+        suffix = 1
+        while name in used:
+            suffix += 1
+            name = excel_safe_sheet_name(f"{base}_{suffix}")
+        used.add(name)
+        unique_sheets.append((name, sdf))
+    return unique_sheets
 
 
 def show_required_fields(title: str, key: str) -> None:
@@ -167,9 +259,11 @@ def main():
     st.title("多云仓自动对账工具 - 主对账 MVP")
     st.caption("固定字段名版本（MVP），按PRD主流程实现")
 
-    tab = st.tabs(["📋 对账主流程"])[0]
+    tab_reconcile, tab_multi, tab_analysis = st.tabs(
+        ["📋 对账主流程", "📦 多仓汇总与回冲", "📊 快递费分析"]
+    )
 
-    with tab:
+    with tab_reconcile:
         st.subheader("字段映射模板")
         template_col1, template_col2 = st.columns([1, 1])
         with template_col1:
@@ -514,6 +608,300 @@ def main():
                 data=output.getvalue(),
                 file_name="对账结果.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+    with tab_multi:
+        st.subheader("1) 多仓快递费汇总（基于多个对账结果表）")
+        st.caption("上传多个对账结果文件，选择字段后导出汇总表。")
+
+        reconcile_items, reconcile_cols = file_uploader_multi_block(
+            "对账结果文件（可多选）",
+            "mw_reconcile_files",
+        )
+
+        default_fields = [
+            "云仓",
+            "物流单号",
+            "店铺名称",
+            "收货省份",
+            "结算重量(取整)",
+            "账单快递费",
+        ]
+        selected_fields = st.multiselect(
+            "选择导出字段（默认已预选 6 个字段）",
+            options=reconcile_cols,
+            default=[c for c in default_fields if c in reconcile_cols],
+            key="mw_summary_fields",
+        )
+
+        max_rows_per_sheet = st.number_input(
+            "分页阈值（行数，超过则按云仓分页导出）",
+            min_value=1,
+            value=800_000,
+            step=50_000,
+            key="mw_summary_max_rows",
+        )
+
+        if st.button("生成多仓汇总表", type="primary", key="mw_build_summary"):
+            if not reconcile_items:
+                st.error("请先上传至少一个对账结果文件")
+                return
+            if not selected_fields:
+                st.error("请至少选择 1 个导出字段")
+                return
+            df_all = read_multi_excel(reconcile_items)
+            if df_all is None or df_all.empty:
+                st.error("读取结果为空，请检查所选 Sheet")
+                return
+
+            df_all = ensure_columns(df_all, selected_fields)
+            export_df = df_all.loc[:, selected_fields].copy()
+
+            st.subheader("多仓汇总预览")
+            st.dataframe(export_df.head(200), use_container_width=True)
+
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                sheets = split_by_warehouse_and_threshold(
+                    export_df,
+                    warehouse_col="云仓",
+                    max_rows=int(max_rows_per_sheet),
+                )
+                for sheet_name, sheet_df in sheets:
+                    sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            st.download_button(
+                label="下载多仓汇总Excel",
+                data=output.getvalue(),
+                file_name="多仓快递费汇总.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="mw_download_summary",
+            )
+
+        st.divider()
+
+        st.subheader("2) 回冲差异分析（新复核结果 vs 旧汇总表）")
+        st.caption("按物流单号汇总快递费等字段，对比新旧差异，导出回冲差异表。")
+
+        new_items, new_cols = file_uploader_multi_block(
+            "新复核结果表（可多选）",
+            "mw_recharge_new",
+        )
+        old_bytes, old_sheet, old_cols = file_uploader_block(
+            "旧汇总表（手动上传）",
+            "mw_recharge_old",
+        )
+
+        compare_candidates = [
+            "账单快递费",
+            "快递费(核算后)",
+            "应付金额",
+            "差异金额",
+            "理论运费",
+            "账单运费",
+        ]
+        compare_options = sorted(set(new_cols) | set(old_cols))
+        default_compare = [c for c in compare_candidates if c in compare_options]
+        compare_fields = st.multiselect(
+            "选择需要对比的字段（可多选）",
+            options=compare_options,
+            default=default_compare[:1] if default_compare else [],
+            key="mw_recharge_compare_fields",
+        )
+
+        if st.button("生成回冲差异表", type="primary", key="mw_build_recharge"):
+            if not new_items:
+                st.error("请上传新复核结果表")
+                return
+            if not old_bytes or not old_sheet:
+                st.error("请上传旧汇总表")
+                return
+            if not compare_fields:
+                st.error("请至少选择 1 个对比字段")
+                return
+
+            new_df = read_multi_excel(new_items)
+            old_df = read_df(old_bytes, old_sheet)
+            if new_df is None or new_df.empty:
+                st.error("新复核结果读取为空，请检查所选 Sheet")
+                return
+            if old_df is None or old_df.empty:
+                st.error("旧汇总表读取为空，请检查所选 Sheet")
+                return
+
+            key_col = "物流单号"
+            if key_col not in new_df.columns or key_col not in old_df.columns:
+                st.error("新旧表均需包含列：物流单号")
+                return
+
+            new_df = ensure_columns(new_df, [key_col] + compare_fields)
+            old_df = ensure_columns(old_df, [key_col] + compare_fields)
+
+            new_agg = aggregate_by_key_sum(new_df, key_col=key_col, value_cols=compare_fields)
+            old_agg = aggregate_by_key_sum(old_df, key_col=key_col, value_cols=compare_fields)
+
+            diff = old_agg.merge(new_agg, on=[key_col], how="outer", suffixes=("_旧", "_新"))
+            for col in compare_fields:
+                old_col = f"{col}_旧"
+                new_col = f"{col}_新"
+                if old_col not in diff.columns:
+                    diff[old_col] = 0
+                if new_col not in diff.columns:
+                    diff[new_col] = 0
+                diff[f"{col}_差异(新-旧)"] = pd.to_numeric(diff[new_col], errors="coerce").fillna(0) - pd.to_numeric(
+                    diff[old_col], errors="coerce"
+                ).fillna(0)
+
+            show_cols: List[str] = [key_col]
+            for col in compare_fields:
+                show_cols += [f"{col}_旧", f"{col}_新", f"{col}_差异(新-旧)"]
+            diff = ensure_columns(diff, show_cols).loc[:, show_cols].copy()
+
+            st.subheader("回冲差异预览")
+            st.dataframe(diff.head(200), use_container_width=True)
+
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                diff.to_excel(writer, sheet_name="回冲差异", index=False)
+            st.download_button(
+                label="下载回冲差异Excel",
+                data=output.getvalue(),
+                file_name="回冲差异表.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="mw_download_recharge",
+            )
+
+    with tab_analysis:
+        st.subheader("快递费分析")
+        st.caption("上传单个云仓的对账结果表，生成省份透视、TOP单品、重量单价表，并导出Excel。")
+
+        analysis_bytes, analysis_sheet, analysis_cols = file_uploader_block(
+            "对账结果表（单文件）",
+            "analysis_file",
+        )
+        if not analysis_bytes or not analysis_sheet:
+            return
+
+        analysis_df = read_df(analysis_bytes, analysis_sheet)
+        if analysis_df is None or analysis_df.empty:
+            st.error("对账结果表为空，请检查所选 Sheet")
+            return
+
+        st.subheader("字段选择")
+        col_left, col_right = st.columns([1, 1])
+        with col_left:
+            order_col = st.selectbox(
+                "订单唯一标识列",
+                options=analysis_cols,
+                index=analysis_cols.index("物流单号") if "物流单号" in analysis_cols else 0,
+                key="analysis_order_col",
+            )
+            province_col = st.selectbox(
+                "省份列",
+                options=analysis_cols,
+                index=analysis_cols.index("收货省份") if "收货省份" in analysis_cols else 0,
+                key="analysis_province_col",
+            )
+            sku_col = st.selectbox(
+                "单品列",
+                options=analysis_cols,
+                index=analysis_cols.index("商家编码") if "商家编码" in analysis_cols else 0,
+                key="analysis_sku_col",
+            )
+        with col_right:
+            weight_col = st.selectbox(
+                "重量列",
+                options=analysis_cols,
+                index=analysis_cols.index("结算重量(取整)") if "结算重量(取整)" in analysis_cols else 0,
+                key="analysis_weight_col",
+            )
+            fee_candidates = ["账单快递费", "快递费(核算后)", "应付金额", "账单运费", "理论运费"]
+            fee_default = next((c for c in fee_candidates if c in analysis_cols), analysis_cols[0])
+            fee_col = st.selectbox(
+                "快递费列（用于统计）",
+                options=analysis_cols,
+                index=analysis_cols.index(fee_default) if fee_default in analysis_cols else 0,
+                key="analysis_fee_col",
+            )
+
+        st.subheader("运营交割价配置")
+        st.caption("填写“重量上限(kg) -> 运营交割价(元)”。未配置时将不计算差价相关字段。")
+        config_init = pd.DataFrame(
+            [
+                {"重量上限(kg)": pd.NA, "运营交割价(元)": pd.NA},
+            ]
+        )
+        config_df = st.data_editor(
+            config_init,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="analysis_price_config",
+        )
+        rules = parse_price_rules(config_df)
+
+        top_n = st.number_input(
+            "TOP 单品数量",
+            min_value=1,
+            value=50,
+            step=10,
+            key="analysis_top_n",
+        )
+
+        if st.button("生成分析", type="primary", key="analysis_run"):
+            missing = [
+                c
+                for c in [order_col, province_col, sku_col, weight_col, fee_col]
+                if c not in analysis_df.columns
+            ]
+            if missing:
+                st.error(f"对账结果表缺少列：{'、'.join(missing)}")
+                return
+
+            with st.spinner("正在生成分析结果..."):
+                pivot_count, pivot_share = compute_province_pivot(
+                    analysis_df,
+                    province_col=province_col,
+                    weight_col=weight_col,
+                    order_col=order_col,
+                )
+                top_sku_df = compute_top_skus(
+                    analysis_df,
+                    sku_col=sku_col,
+                    weight_col=weight_col,
+                    fee_col=fee_col,
+                    order_col=order_col,
+                    rules=rules,
+                    top_n=int(top_n),
+                )
+                weight_price_df = compute_weight_price_table(
+                    analysis_df,
+                    weight_col=weight_col,
+                    fee_col=fee_col,
+                    order_col=order_col,
+                    rules=rules,
+                )
+
+            st.subheader("省份透视（单量）")
+            st.dataframe(pivot_count, use_container_width=True)
+            st.subheader("省份透视（占比）")
+            st.dataframe(pivot_share, use_container_width=True)
+            st.subheader("TOP 单品")
+            st.dataframe(top_sku_df, use_container_width=True)
+            st.subheader("重量单价表")
+            st.dataframe(weight_price_df, use_container_width=True)
+
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                pivot_count.to_excel(writer, sheet_name="省份透视_单量", index=False)
+                pivot_share.to_excel(writer, sheet_name="省份透视_占比", index=False)
+                top_sku_df.to_excel(writer, sheet_name="TOP单品", index=False)
+                weight_price_df.to_excel(writer, sheet_name="重量单价", index=False)
+
+            st.download_button(
+                label="下载分析Excel",
+                data=output.getvalue(),
+                file_name="快递费分析.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="analysis_download",
             )
 
 

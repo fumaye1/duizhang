@@ -384,7 +384,7 @@ def reconcile_main(
     # Merge bills onto detail; bills are pre-aggregated to avoid duplicates when multiple files exist.
     df = df.merge(
         bill_agg_df[["物流单号", "计费重量(kg)", "快递费(元)", "包装费(元)", "云仓"]],
-        on=["物流单号"],
+        on=["物流单号", "云仓"],
         how="left",
         suffixes=("", "_账单"),
     )
@@ -398,7 +398,16 @@ def reconcile_main(
     )
 
     # Append bill rows that have no matching detail.
-    missing_detail_bill = bill_agg_df[~bill_agg_df["物流单号"].isin(df["物流单号"])]
+    detail_keys = df[["物流单号", "云仓"]].drop_duplicates()
+    missing_detail_bill = bill_agg_df.merge(
+        detail_keys,
+        on=["物流单号", "云仓"],
+        how="left",
+        indicator=True,
+    )
+    missing_detail_bill = missing_detail_bill[missing_detail_bill["_merge"] == "left_only"].drop(
+        columns=["_merge"]
+    )
     if not missing_detail_bill.empty:
         extra = missing_detail_bill.copy()
         extra["快递公司"] = ""
@@ -430,7 +439,9 @@ def reconcile_main(
     summary_df = summarize_by(["云仓", "快递公司"], df)
 
     output_columns = [
+        "云仓",
         "物流单号",
+        "快递公司",
         "商家编码",
         "收货省份",
         "数量",
@@ -442,7 +453,9 @@ def reconcile_main(
         "耗材费",
         "撕单",
         "售后赔付",
+        "账单计费重量",
         "账单快递费",
+        "账单包装费",
         "差异金额",
         "应付金额",
         "备注",
