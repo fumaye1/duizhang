@@ -37,6 +37,24 @@ def normalize_province(value: str) -> str:
     text = str(value).strip()
     if not text:
         return ""
+
+    # If a cell accidentally contains multiple addresses separated by '/', keep the first.
+    for sep in ["/", "\\", "／"]:
+        if sep in text:
+            text = text.split(sep, 1)[0].strip()
+
+    # Remove whitespace to improve pattern matching: "北京 北京市 昌平区" -> "北京北京市昌平区"
+    text_compact = "".join(str(text).split())
+
+    # Direct-controlled municipalities should not keep the suffix "市".
+    municipalities = ["北京", "上海", "天津", "重庆"]
+    for name in municipalities:
+        if text_compact.startswith(name):
+            return name
+        if name + "市" in text_compact:
+            return name
+
+    text = text_compact
     for suffix in ["自治区", "省", "市"]:
         if suffix in text:
             idx = text.find(suffix)
@@ -45,9 +63,12 @@ def normalize_province(value: str) -> str:
 
 
 def parse_ship_province(df: pd.DataFrame, erp_type: str) -> pd.Series:
-    if erp_type == "wdt":
+    # Prefer a pre-normalized province column if present.
+    if "收货省份" in df.columns:
         return df["收货省份"].astype(str)
-    return df["收货地址"].astype(str)
+    if "收货地址" in df.columns:
+        return df["收货地址"].astype(str)
+    return pd.Series([""] * len(df))
 
 
 def safe_to_datetime(series: pd.Series) -> pd.Series:
@@ -193,11 +214,52 @@ def summarize_by(columns: List[str], df: pd.DataFrame) -> pd.DataFrame:
     return summary
 
 
+def _ensure_columns(df: pd.DataFrame, cols: Iterable[str], fill_value=np.nan) -> pd.DataFrame:
+    df = df.copy()
+    for col in cols:
+        if col not in df.columns:
+            df[col] = fill_value
+    return df
+
+
+def aggregate_bill_df(bill_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate cloud-warehouse bills so multiple files / split bills can be merged safely.
+
+    Strategy:
+    - Group by (物流单号, 云仓)
+    - Sum fees (快递费(元), 包装费(元))
+    - Take max of 计费重量(kg)
+    """
+    if bill_df is None or bill_df.empty:
+        return pd.DataFrame(columns=["物流单号", "云仓", "计费重量(kg)", "快递费(元)", "包装费(元)"])
+
+    df = bill_df.copy()
+    df = _ensure_columns(df, ["包装费(元)"])
+    df["物流单号"] = df["物流单号"].astype(str)
+    df["云仓"] = df["云仓"].astype(str)
+    df["计费重量(kg)"] = ensure_numeric(df["计费重量(kg)"])
+    df["快递费(元)"] = ensure_numeric(df["快递费(元)"])
+    df["包装费(元)"] = ensure_numeric(df["包装费(元)"])
+
+    agg = (
+        df.groupby(["物流单号", "云仓"], dropna=False)
+        .agg(
+            **{
+                "计费重量(kg)": ("计费重量(kg)", "max"),
+                "快递费(元)": ("快递费(元)", "sum"),
+                "包装费(元)": ("包装费(元)", "sum"),
+            }
+        )
+        .reset_index()
+    )
+    return agg
+
+
 def reconcile_main(
-    detail_df: pd.DataFrame,
-    maozhong_df: pd.DataFrame,
-    weight_segments_df: pd.DataFrame,
-    tariff_df: pd.DataFrame,
+    detail_df: Optional[pd.DataFrame],
+    maozhong_df: Optional[pd.DataFrame],
+    weight_segments_df: Optional[pd.DataFrame],
+    tariff_df: Optional[pd.DataFrame],
     bill_df: pd.DataFrame,
     config: ReconcileConfig,
     yubao_map_df: Optional[pd.DataFrame] = None,
@@ -205,6 +267,54 @@ def reconcile_main(
     tear_df: Optional[pd.DataFrame] = None,
     aftersale_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    bill_agg_df = aggregate_bill_df(bill_df)
+
+    # If there is no detail, still surface bill rows in outputs.
+    if detail_df is None or detail_df.empty:
+        bill_only = bill_agg_df.copy()
+        bill_only["快递公司"] = ""
+        bill_only["账单计费重量"] = bill_only["计费重量(kg)"]
+        bill_only["账单快递费"] = bill_only["快递费(元)"]
+        bill_only["账单包装费"] = bill_only["包装费(元)"]
+        bill_only["快递费(核算后)"] = 0.0
+        bill_only["差异金额"] = bill_only["账单快递费"].fillna(0)
+        bill_only["售后赔付"] = 0.0
+        bill_only["应付金额"] = 0.0
+        bill_only["备注"] = "发货明细缺失"
+
+        output_columns = [
+            "物流单号",
+            "商家编码",
+            "收货省份",
+            "数量",
+            "店铺名称",
+            "计费重量原始",
+            "毛重(g)",
+            "结算重量(取整)",
+            "快递费(核算后)",
+            "耗材费",
+            "撕单",
+            "售后赔付",
+            "账单快递费",
+            "差异金额",
+            "应付金额",
+            "备注",
+            "云仓",
+            "快递公司",
+        ]
+        bill_only = _ensure_columns(bill_only, output_columns)
+        result_df = bill_only.loc[:, output_columns].copy()
+        result_df = result_df.rename(columns={"计费重量原始": "预估重量"})
+
+        exception_df = pd.DataFrame(
+            [{"物流单号": str(x), "原因": "发货明细缺失"} for x in result_df["物流单号"].astype(str)]
+        )
+        summary_df = summarize_by(["云仓", "快递公司"], result_df)
+        return result_df, summary_df, exception_df
+
+    if maozhong_df is None or weight_segments_df is None or tariff_df is None:
+        raise ValueError("存在发货明细时，毛重表/重量段定义表/资费表为必填")
+
     df = detail_df.copy()
     df["发货时间"] = safe_to_datetime(df["发货时间"])
     df["快递公司"] = df["快递公司"].astype(str)
@@ -271,11 +381,10 @@ def reconcile_main(
         )
         df["售后赔付"] = df["物流单号"].map(lambda x: pay_map.get(str(x), 0.0))
 
-    bill_df = bill_df.copy()
-    bill_df["物流单号"] = bill_df["物流单号"].astype(str)
+    # Merge bills onto detail; bills are pre-aggregated to avoid duplicates when multiple files exist.
     df = df.merge(
-        bill_df[["物流单号", "计费重量(kg)", "快递费(元)", "包装费(元)", "云仓"]],
-        on="物流单号",
+        bill_agg_df[["物流单号", "计费重量(kg)", "快递费(元)", "包装费(元)", "云仓"]],
+        on=["物流单号"],
         how="left",
         suffixes=("", "_账单"),
     )
@@ -287,6 +396,20 @@ def reconcile_main(
         },
         inplace=True,
     )
+
+    # Append bill rows that have no matching detail.
+    missing_detail_bill = bill_agg_df[~bill_agg_df["物流单号"].isin(df["物流单号"])]
+    if not missing_detail_bill.empty:
+        extra = missing_detail_bill.copy()
+        extra["快递公司"] = ""
+        extra["账单计费重量"] = extra["计费重量(kg)"]
+        extra["账单快递费"] = extra["快递费(元)"]
+        extra["账单包装费"] = extra["包装费(元)"]
+        extra["快递费(核算后)"] = 0.0
+        extra["备注"] = "发货明细缺失"
+
+        # Keep consistent columns for downstream calculations.
+        df = pd.concat([df, extra], ignore_index=True, sort=False)
 
     df["差异金额"] = df["账单快递费"].fillna(0) - df["快递费(核算后)"].fillna(0)
     df["应付金额"] = df["快递费(核算后)"].fillna(0) - df["售后赔付"].fillna(0)
@@ -328,7 +451,7 @@ def reconcile_main(
         if col not in df.columns:
             df[col] = np.nan
 
-    result_df = df[output_columns]
-    result_df.rename(columns={"计费重量原始": "预估重量"}, inplace=True)
+    result_df = df.loc[:, output_columns].copy()
+    result_df = result_df.rename(columns={"计费重量原始": "预估重量"})
 
     return result_df, summary_df, exception_df
