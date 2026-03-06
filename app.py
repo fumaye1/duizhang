@@ -30,24 +30,88 @@ from wps_http_client import HttpMetricConfig, fetch_metric
 st.set_page_config(page_title="多云仓自动对账工具", layout="wide")
 
 
-@st.cache_data(show_spinner=False)
-def load_excel(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
-    return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name)
+MULTI_STANDARD_FIELDS: List[str] = [
+    "云仓",
+    "物流单号",
+    "商家编码",
+    "数量",
+    "货品数量",
+    "实际重量",
+    "结算重量(取整)",
+    "收货省份",
+    "店铺名称",
+    "账单快递费",
+    "快递费(核算后)",
+    "应付金额",
+    "差异金额",
+    "理论运费",
+    "账单运费",
+]
 
 
-def file_uploader_block(label: str, key: str) -> Tuple[Optional[bytes], Optional[str], List[str]]:
-    uploaded = st.file_uploader(label, type=["xlsx", "xls"], key=key)
-    if not uploaded:
-        return None, None, []
-    xls = pd.ExcelFile(uploaded)
-    sheet = st.selectbox(f"选择Sheet - {label}", xls.sheet_names, key=f"sheet_{key}")
-    data = load_excel(uploaded.getvalue(), sheet)
-    return uploaded.getvalue(), sheet, list(data.columns)
+ExcelSheetItem = Tuple[bytes, str, str, str, List[str]]
 
 
-def file_uploader_multi_block(
+def _collect_excel_items_from_workbooks(
+    *,
+    label: str,
+    key: str,
+    workbooks: List[Tuple[bytes, str, str, List[str]]],
+) -> Tuple[List[ExcelSheetItem], List[str]]:
+    items: List[ExcelSheetItem] = []
+    all_cols: set[str] = set()
+
+    total_sheets = sum(len(sheets) for _b, _n, _e, sheets in workbooks)
+    if total_sheets <= 0:
+        return [], []
+
+    progress = st.progress(0)
+    status_text = st.empty()
+    done = 0
+    for file_bytes, name, engine, sheets in workbooks:
+        status_text.write(f"字段检查（仅读表头）：{name}（{len(sheets)} 个Sheet）")
+        for sheet in sheets:
+            cols = load_excel_columns(file_bytes, sheet, engine=engine)
+            all_cols.update(cols)
+            items.append((file_bytes, sheet, name, engine, cols))
+            done += 1
+            progress.progress(min(1.0, done / max(1, total_sheets)))
+    status_text.empty()
+    return items, sorted(all_cols)
+
+
+def ordered_multiselect(
+    label: str,
+    options: List[str],
+    default: Optional[List[str]],
+    key: str,
+    help_text: Optional[str] = None,
+) -> List[str]:
+    """A multiselect that preserves selection order in session_state.
+
+    Streamlit's multiselect returns values in option order; we maintain an explicit order list.
+    """
+
+    selected = st.multiselect(label, options=options, default=default or [], key=key, help=help_text)
+    order_key = f"{key}__order"
+    prev_order: List[str] = list(st.session_state.get(order_key, []))
+
+    # Remove deselected
+    selected_set = set(selected)
+    new_order = [x for x in prev_order if x in selected_set]
+
+    # Append newly selected
+    for x in selected:
+        if x not in new_order:
+            new_order.append(x)
+
+    st.session_state[order_key] = new_order
+    return new_order
+
+
+def file_uploader_multi_block_named(
     label: str, key: str
-) -> Tuple[List[Tuple[bytes, str]], List[str]]:
+) -> Tuple[List[Tuple[bytes, str, str, str, List[str]]], List[str]]:
     uploaded_files = st.file_uploader(
         label,
         type=["xlsx", "xls"],
@@ -57,49 +121,270 @@ def file_uploader_multi_block(
     if not uploaded_files:
         return [], []
 
-    items: List[Tuple[bytes, str]] = []
-    all_cols: set[str] = set()
     with st.expander(f"{label}（已上传 {len(uploaded_files)} 个文件）", expanded=True):
+        st.caption("可为每个工作簿多选 Sheet（选中的每个 Sheet 会参与后续生成）。")
+
+        st.caption("性能优化：上传阶段仅解析 Sheet 名；字段检查仅读取表头；生成时才读取明细数据。")
+
+        workbooks: List[Tuple[bytes, str, str, List[str]]] = []
         for i, uploaded in enumerate(uploaded_files):
-            xls = pd.ExcelFile(uploaded)
-            sheet = st.selectbox(
-                f"选择Sheet - {uploaded.name}",
-                xls.sheet_names,
-                key=f"sheet_{key}_{i}",
+            file_bytes = uploaded.getvalue()
+            xls, engine = _safe_excel_file(file_bytes, uploaded.name, f"{label}:{uploaded.name}")
+            if xls is None or engine is None:
+                st.warning(f"已跳过文件：{uploaded.name}")
+                continue
+
+            selected_sheets = st.multiselect(
+                f"选择Sheet（可多选）- {uploaded.name}",
+                options=xls.sheet_names,
+                default=[xls.sheet_names[0]] if xls.sheet_names else [],
+                key=f"sheets_{key}_{i}",
             )
-            df_preview = load_excel(uploaded.getvalue(), sheet)
-            all_cols.update(list(df_preview.columns))
-            items.append((uploaded.getvalue(), sheet))
+            if not selected_sheets:
+                st.warning(f"未选择任何Sheet，已跳过：{uploaded.name}")
+                continue
 
-    return items, sorted(all_cols)
+            workbooks.append((file_bytes, uploaded.name, engine, list(selected_sheets)))
+
+        items, all_cols = _collect_excel_items_from_workbooks(label=label, key=key, workbooks=workbooks)
+    return items, all_cols
 
 
-def read_df(file_bytes: Optional[bytes], sheet: Optional[str]) -> Optional[pd.DataFrame]:
-    if not file_bytes or not sheet:
+def file_uploader_block_named(label: str, key: str) -> Tuple[List[ExcelSheetItem], List[str]]:
+    uploaded = st.file_uploader(label, type=["xlsx", "xls"], key=key)
+    if not uploaded:
+        return [], []
+
+    file_bytes = uploaded.getvalue()
+    xls, engine = _safe_excel_file(file_bytes, uploaded.name, label)
+    if xls is None or engine is None:
+        return [], []
+
+    with st.expander(f"{label}（已上传 1 个文件）", expanded=True):
+        st.caption("可多选 Sheet（选中的每个 Sheet 会参与后续计算/生成）。")
+        st.caption("性能优化：上传阶段仅解析 Sheet 名；字段检查仅读取表头；需要时才读取明细数据。")
+
+        selected_sheets = st.multiselect(
+            f"选择Sheet（可多选）- {uploaded.name}",
+            options=xls.sheet_names,
+            default=[xls.sheet_names[0]] if xls.sheet_names else [],
+            key=f"sheets_{key}",
+        )
+        if not selected_sheets:
+            st.warning("未选择任何Sheet")
+            return [], []
+
+        workbooks = [(file_bytes, uploaded.name, engine, list(selected_sheets))]
+        return _collect_excel_items_from_workbooks(label=label, key=key, workbooks=workbooks)
+
+
+def build_per_file_hit_status_ui(
+    *,
+    file_name: str,
+    file_cols: List[str],
+    standard_fields_ordered: List[str],
+) -> List[str]:
+    if not standard_fields_ordered:
+        return []
+
+    missing = [f for f in standard_fields_ordered if f not in set(file_cols)]
+    with st.expander(f"字段命中检查 - {file_name}", expanded=True):
+        if not missing:
+            st.success("全部命中")
+        else:
+            st.error("未命中字段：" + "、".join(missing))
+            st.info("请在源表中把列名手动改为规范字段名后重新上传（本工具不会自动清洗/改列名）。")
+    return missing
+
+
+@st.cache_data(show_spinner=False)
+def load_excel(file_bytes: bytes, sheet_name: str, engine: Optional[str] = None) -> pd.DataFrame:
+    return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, engine=engine)
+
+
+@st.cache_data(show_spinner=False)
+def load_excel_columns(file_bytes: bytes, sheet_name: str, engine: Optional[str] = None) -> List[str]:
+    """Load only header row (nrows=0) to get columns quickly."""
+    df0 = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, engine=engine, nrows=0)
+    return list(df0.columns)
+
+
+@st.cache_data(show_spinner=False)
+def load_excel_usecols(
+    file_bytes: bytes,
+    sheet_name: str,
+    engine: Optional[str],
+    usecols: Tuple[str, ...],
+) -> pd.DataFrame:
+    """Load only selected columns to speed up large sheets."""
+    return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, engine=engine, usecols=list(usecols))
+
+
+def _detect_excel_engine(file_bytes: bytes) -> Optional[str]:
+    if not file_bytes:
         return None
-    return load_excel(file_bytes, sheet)
+
+    # xlsx is a zip file
+    if file_bytes[:2] == b"PK":
+        return "openpyxl"
+
+    # xls is an OLE2 compound document
+    if file_bytes[:8] == b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1":
+        return "xlrd"
+
+    return None
+
+
+def _safe_excel_file(file_bytes: bytes, filename: str, context_label: str) -> Tuple[Optional[pd.ExcelFile], Optional[str]]:
+    engine = _detect_excel_engine(file_bytes)
+    if engine is None:
+        st.error(
+            "上传文件看起来不是有效的Excel工作簿（无法识别为 xlsx/xls）。\n"
+            "请确认文件未损坏，并优先使用 .xlsx 格式重新导出/另存后上传。\n\n"
+            f"文件：{filename}\n"
+            f"位置：{context_label}"
+        )
+        return None, None
+
+    ext = str(filename).lower()
+    if ext.endswith(".xls") and engine == "openpyxl":
+        st.warning(
+            f"文件扩展名为 .xls，但内容更像 .xlsx（ZIP）。建议将文件改为 .xlsx 后再上传：{filename}"
+        )
+    if ext.endswith(".xlsx") and engine == "xlrd":
+        st.warning(
+            f"文件扩展名为 .xlsx，但内容更像 .xls（OLE2）。建议将文件改为 .xls 或重新导出：{filename}"
+        )
+
+    try:
+        xls = pd.ExcelFile(io.BytesIO(file_bytes), engine=engine)
+        return xls, engine
+    except ImportError as e:
+        if engine == "xlrd":
+            st.error(
+                "检测到 .xls（旧版Excel）文件，但当前环境缺少读取依赖：xlrd。\n"
+                "解决方式：\n"
+                "1) 安装依赖：pip install xlrd>=2.0.1（推荐），或\n"
+                "2) 将文件另存为 .xlsx 后重新上传。\n\n"
+                f"文件：{filename}\n错误：{e}"
+            )
+        else:
+            st.error(f"读取Excel失败：{filename}。错误：{e}")
+        return None, None
+    except Exception as e:
+        # Common case: xlrd.biffh.XLRDError: Can't find workbook in OLE2 compound document
+        err_name = type(e).__name__
+        if err_name == "XLRDError":
+            st.error(
+                "读取 .xls 失败：文件内容不是有效的 xls 工作簿（可能是文件损坏，或扩展名与实际格式不一致）。\n"
+                "建议：\n"
+                "- 用Excel/WPS重新‘另存为’ .xlsx 后上传；或\n"
+                "- 重新从源系统导出账单/结果表（避免中间拷贝/改后缀）。\n\n"
+                f"文件：{filename}\n错误：{e}"
+            )
+        else:
+            st.error(
+                "读取Excel失败（可能是文件损坏或格式不兼容）。\n"
+                "建议优先另存为 .xlsx 再上传。\n\n"
+                f"文件：{filename}\n错误类型：{err_name}\n错误：{e}"
+            )
+        return None, None
+def file_uploader_block(label: str, key: str) -> Tuple[List[ExcelSheetItem], List[str]]:
+    """Single-file uploader with multi-sheet selection (unified behavior)."""
+    return file_uploader_block_named(label, key)
+
+
+def file_uploader_multi_block(
+    label: str, key: str
+) -> Tuple[List[ExcelSheetItem], List[str]]:
+    # Backward-compatible wrapper: keep name but return the new named-item shape.
+    return file_uploader_multi_block_named(label, key)
+
+
+def read_df_items(items: List[ExcelSheetItem]) -> Optional[pd.DataFrame]:
+    if not items:
+        return None
+    dfs: List[pd.DataFrame] = []
+    for file_bytes, sheet, _name, engine, _cols in items:
+        dfs.append(load_excel(file_bytes, sheet, engine=engine))
+    if not dfs:
+        return None
+    return pd.concat(dfs, ignore_index=True)
+
+
+def read_df_items_with_progress(
+    *,
+    items: List[ExcelSheetItem],
+    title: str,
+) -> Optional[pd.DataFrame]:
+    if not items:
+        return None
+
+    total = len(items)
+    progress = st.progress(0)
+    status = st.empty()
+    dfs: List[pd.DataFrame] = []
+    for idx, (file_bytes, sheet, name, engine, _cols) in enumerate(items, start=1):
+        status.write(f"正在读取{title}：{name}::{sheet}（{idx}/{total}）")
+        dfs.append(load_excel(file_bytes, sheet, engine=engine))
+        progress.progress(min(1.0, idx / max(1, total)))
+    status.empty()
+    if not dfs:
+        return None
+    return pd.concat(dfs, ignore_index=True)
+
+
+def read_and_map_multi_with_progress(
+    *,
+    items: List[ExcelSheetItem],
+    mapping: Dict[str, str],
+    title: str,
+) -> Optional[pd.DataFrame]:
+    if not items:
+        return None
+
+    usecols_list = [v for v in mapping.values() if v]
+    usecols = tuple(sorted(set(usecols_list)))
+
+    total = len(items)
+    progress = st.progress(0)
+    status = st.empty()
+    dfs: List[pd.DataFrame] = []
+    for idx, (file_bytes, sheet, name, engine, _cols) in enumerate(items, start=1):
+        status.write(f"正在读取{title}：{name}::{sheet}（{idx}/{total}）")
+        if usecols:
+            raw = load_excel_usecols(file_bytes, sheet, engine, usecols)
+        else:
+            raw = load_excel(file_bytes, sheet, engine=engine)
+        dfs.append(apply_mapping(raw, mapping))
+        progress.progress(min(1.0, idx / max(1, total)))
+    status.empty()
+    if not dfs:
+        return None
+    return pd.concat(dfs, ignore_index=True)
 
 
 def read_and_map_multi(
-    items: List[Tuple[bytes, str]], mapping: Dict[str, str]
+    items: List[ExcelSheetItem],
+    mapping: Dict[str, str],
 ) -> Optional[pd.DataFrame]:
     if not items:
         return None
     dfs: List[pd.DataFrame] = []
-    for file_bytes, sheet in items:
-        raw = load_excel(file_bytes, sheet)
+    for file_bytes, sheet, _name, engine, _cols in items:
+        raw = load_excel(file_bytes, sheet, engine=engine)
         dfs.append(apply_mapping(raw, mapping))
     if not dfs:
         return None
     return pd.concat(dfs, ignore_index=True)
 
 
-def read_multi_excel(items: List[Tuple[bytes, str]]) -> Optional[pd.DataFrame]:
+def read_multi_excel(items: List[ExcelSheetItem]) -> Optional[pd.DataFrame]:
     if not items:
         return None
     dfs: List[pd.DataFrame] = []
-    for file_bytes, sheet in items:
-        dfs.append(load_excel(file_bytes, sheet))
+    for file_bytes, sheet, _name, engine, _cols in items:
+        dfs.append(load_excel(file_bytes, sheet, engine=engine))
     if not dfs:
         return None
     return pd.concat(dfs, ignore_index=True)
@@ -242,6 +527,142 @@ def mapping_duplicates(mapping: Dict[str, str]) -> List[str]:
     return sorted({val for val in values if values.count(val) > 1})
 
 
+def _parse_csv_fields(text: str) -> List[str]:
+    if not text:
+        return []
+    parts = [p.strip() for p in str(text).replace("\n", ",").split(",")]
+    return [p for p in parts if p]
+
+
+def _parse_lines(text: str) -> List[str]:
+    if not text:
+        return []
+    return [line.strip() for line in str(text).splitlines() if line.strip()]
+
+
+def _unique_keep_order(items: List[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def bulk_mapping_ui(
+    title: str,
+    available_cols: List[str],
+    base_standard_fields: List[str],
+    key_prefix: str,
+    preset: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, str], List[str], List[str]]:
+    """Fast mapping UI.
+
+    Returns:
+      mapping: {standard_field: source_col}
+      missing: kept for API symmetry (currently always [])
+      standard_fields: effective standard field list (base + user extras)
+    """
+
+    if not available_cols:
+        return {}, [], base_standard_fields
+
+    with st.expander(f"{title}字段映射（批量）", expanded=False):
+        auto_same_name = st.checkbox(
+            "自动匹配同名字段（规范字段名在源表中存在时自动映射）",
+            value=True,
+            key=f"{key_prefix}_auto_same",
+        )
+
+        extra_std = st.text_input(
+            "新增规范字段（逗号或换行分隔，可选）",
+            value="",
+            key=f"{key_prefix}_extra_std",
+            help="用于临时增加规范字段，例如：体积重量、商品名称等。",
+        )
+        extra_std_fields = _parse_csv_fields(extra_std)
+        standard_fields = _unique_keep_order(list(base_standard_fields) + extra_std_fields)
+
+        preset = preset or {}
+        preset_targets = [k for k in standard_fields if k in preset]
+        preset_sources = [preset.get(k, "") for k in preset_targets]
+
+        st.markdown("**1) 选择需要映射的规范字段**")
+        tcol1, tcol2 = st.columns([1, 1])
+        with tcol1:
+            target_selected = st.multiselect(
+                "规范字段（可多选）",
+                options=standard_fields,
+                default=preset_targets,
+                key=f"{key_prefix}_targets_ms",
+            )
+        with tcol2:
+            target_text_default = "\n".join(preset_targets or target_selected)
+            target_order_text = st.text_area(
+                "已选规范字段（可调整顺序，一行一个）",
+                value=target_text_default,
+                height=160,
+                key=f"{key_prefix}_targets_text",
+            )
+        targets_ordered = _unique_keep_order(_parse_lines(target_order_text) or target_selected)
+
+        st.markdown("**2) 选择源表字段（与上方规范字段按顺序一一对应）**")
+        scol1, scol2 = st.columns([1, 1])
+        with scol1:
+            source_selected = st.multiselect(
+                "源表字段（可多选）",
+                options=available_cols,
+                default=[c for c in preset_sources if c in available_cols],
+                key=f"{key_prefix}_sources_ms",
+            )
+        with scol2:
+            source_text_default = "\n".join([c for c in preset_sources if c in available_cols] or source_selected)
+            source_order_text = st.text_area(
+                "已选源表字段（可调整顺序，一行一个）",
+                value=source_text_default,
+                height=160,
+                key=f"{key_prefix}_sources_text",
+            )
+        sources_ordered_raw = _unique_keep_order(_parse_lines(source_order_text) or source_selected)
+
+        invalid_sources = [c for c in sources_ordered_raw if c not in set(available_cols)]
+        if invalid_sources:
+            st.warning(f"以下源表字段不存在，将被忽略：{invalid_sources}")
+        sources_ordered = [c for c in sources_ordered_raw if c in set(available_cols)]
+
+        if targets_ordered and sources_ordered and len(targets_ordered) != len(sources_ordered):
+            st.warning(
+                f"规范字段数量({len(targets_ordered)})与源表字段数量({len(sources_ordered)})不一致，将按最短长度配对。"
+            )
+
+        mapping: Dict[str, str] = {}
+        for t, s in zip(targets_ordered, sources_ordered):
+            if not t or not s:
+                continue
+            mapping[t] = s
+
+        if auto_same_name:
+            for t in standard_fields:
+                if t in mapping:
+                    continue
+                if t in available_cols:
+                    mapping[t] = t
+
+        dup_sources = mapping_duplicates(mapping)
+        if dup_sources:
+            st.warning(f"检测到重复映射（多个规范字段指向同一源字段）：{dup_sources}")
+
+        if mapping:
+            preview_rows = [{"规范字段": k, "源表字段": v} for k, v in mapping.items()]
+            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("尚未生成映射：请选择规范字段与源表字段，或启用同名字段自动匹配。")
+
+    return mapping, [], standard_fields
+
+
 def build_template(
     mappings: Dict[str, Dict[str, str]],
     erp_type: str,
@@ -256,6 +677,14 @@ def build_template(
 def load_template(file_bytes: bytes) -> Dict[str, Dict[str, str]]:
     payload = json.loads(file_bytes.decode("utf-8"))
     return payload
+
+
+def build_multi_template(mappings: Dict[str, Dict[str, str]]) -> Dict[str, object]:
+    return {
+        "version": "v1",
+        "scope": "multi",
+        "mappings": mappings,
+    }
 
 
 def main():
@@ -313,13 +742,11 @@ def main():
             preset=template_data.get("mappings", {}).get("detail_yubao"),
         )
 
-        yubao_bytes = yubao_sheet = None
+        yubao_map_items: List[ExcelSheetItem] = []
         yubao_mapping, yubao_missing = {}, []
         if yubao_items:
             st.subheader("2. 云宝名称货品表（云宝明细必填）")
-            yubao_bytes, yubao_sheet, yubao_map_cols = file_uploader_block(
-                "云宝名称货品表", "yubao_map"
-            )
+            yubao_map_items, yubao_map_cols = file_uploader_block("云宝名称货品表", "yubao_map")
             show_required_fields("云宝名称货品表", "yubao_map")
             yubao_mapping, yubao_missing = mapping_ui(
                 "云宝名称货品表",
@@ -331,7 +758,7 @@ def main():
             )
 
         st.subheader("3. 毛重表")
-        maozhong_bytes, maozhong_sheet, maozhong_cols = file_uploader_block("毛重表", "maozhong")
+        maozhong_items, maozhong_cols = file_uploader_block("毛重表", "maozhong")
         show_required_fields("毛重表", "maozhong")
         maozhong_mapping, maozhong_missing = mapping_ui(
             "毛重表",
@@ -343,7 +770,7 @@ def main():
         )
 
         st.subheader("4. 重量段定义表")
-        weight_bytes, weight_sheet, weight_cols = file_uploader_block("重量段定义表", "weight_segments")
+        weight_items, weight_cols = file_uploader_block("重量段定义表", "weight_segments")
         show_required_fields("重量段定义表", "weight_segments")
         weight_mapping, weight_missing = mapping_ui(
             "重量段定义表",
@@ -355,19 +782,19 @@ def main():
         )
 
         st.subheader("5. 多条件资费表")
-        tariff_bytes, tariff_sheet, tariff_cols = file_uploader_block("多条件资费表", "tariff")
+        tariff_items, tariff_cols = file_uploader_block("多条件资费表", "tariff")
         show_required_fields("多条件资费表", "tariff")
         tariff_mapping, tariff_missing = mapping_ui(
             "多条件资费表",
             REQUIRED_COLUMNS["tariff"],
-            ["快递费(元)", "快递费", "首重价格", "续重价格"],
+            [],
             tariff_cols,
             "tariff",
             preset=template_data.get("mappings", {}).get("tariff"),
         )
 
         st.subheader("6. 辅助数据源")
-        consumable_bytes, consumable_sheet, consumable_cols = file_uploader_block("耗材表（可选）", "consumables")
+        consumable_items, consumable_cols = file_uploader_block("耗材表（可选）", "consumables")
         consumable_mapping, _ = mapping_ui(
             "耗材表",
             [],
@@ -377,7 +804,7 @@ def main():
             preset=template_data.get("mappings", {}).get("consumables"),
         )
 
-        tear_bytes, tear_sheet, tear_cols = file_uploader_block("撕单表（可选）", "tear")
+        tear_items, tear_cols = file_uploader_block("撕单表（可选）", "tear")
         tear_mapping, _ = mapping_ui(
             "撕单表",
             REQUIRED_COLUMNS["tear"],
@@ -387,7 +814,7 @@ def main():
             preset=template_data.get("mappings", {}).get("tear"),
         )
 
-        after_bytes, after_sheet, after_cols = file_uploader_block("售后赔付表（可选）", "aftersale")
+        after_items, after_cols = file_uploader_block("售后赔付表（可选）", "aftersale")
         after_mapping, _ = mapping_ui(
             "售后赔付表",
             REQUIRED_COLUMNS["aftersale"],
@@ -448,13 +875,13 @@ def main():
             if not bill_items:
                 missing_files.append("云仓账单")
             if has_detail:
-                if not maozhong_bytes:
+                if not maozhong_items:
                     missing_files.append("毛重表")
-                if not weight_bytes:
+                if not weight_items:
                     missing_files.append("重量段定义表")
-                if not tariff_bytes:
+                if not tariff_items:
                     missing_files.append("多条件资费表")
-                if yubao_items and not yubao_bytes:
+                if yubao_items and not yubao_map_items:
                     missing_files.append("云宝名称货品表")
 
             if missing_files:
@@ -493,30 +920,57 @@ def main():
                     st.error(f"{title}映射存在重复列：{'、'.join(duplicates)}")
                     return
 
-            bill_df = read_and_map_multi(bill_items, bill_mapping)
-            wdt_df = read_and_map_multi(wdt_items, wdt_mapping)
-            yubao_detail_df = read_and_map_multi(yubao_items, yubao_detail_mapping)
-            maozhong_df = (
-                apply_mapping(read_df(maozhong_bytes, maozhong_sheet), maozhong_mapping)
-                if maozhong_bytes
-                else None
-            )
-            weight_df = (
-                apply_mapping(read_df(weight_bytes, weight_sheet), weight_mapping) if weight_bytes else None
-            )
-            tariff_df = (
-                apply_mapping(read_df(tariff_bytes, tariff_sheet), tariff_mapping) if tariff_bytes else None
-            )
-            yubao_map_df = (
-                apply_mapping(read_df(yubao_bytes, yubao_sheet), yubao_mapping) if yubao_bytes else None
-            )
-            consumable_df = (
-                apply_mapping(read_df(consumable_bytes, consumable_sheet), consumable_mapping)
-                if consumable_bytes
-                else None
-            )
-            tear_df = apply_mapping(read_df(tear_bytes, tear_sheet), tear_mapping) if tear_bytes else None
-            after_df = apply_mapping(read_df(after_bytes, after_sheet), after_mapping) if after_bytes else None
+            with st.spinner("正在读取并映射数据..."):
+                bill_df = read_and_map_multi_with_progress(
+                    items=bill_items,
+                    mapping=bill_mapping,
+                    title="云仓账单",
+                )
+                wdt_df = read_and_map_multi_with_progress(
+                    items=wdt_items,
+                    mapping=wdt_mapping,
+                    title="旺店通发货明细",
+                )
+                yubao_detail_df = read_and_map_multi_with_progress(
+                    items=yubao_items,
+                    mapping=yubao_detail_mapping,
+                    title="云宝发货明细",
+                )
+                maozhong_df = read_and_map_multi_with_progress(
+                    items=maozhong_items,
+                    mapping=maozhong_mapping,
+                    title="毛重表",
+                )
+                weight_df = read_and_map_multi_with_progress(
+                    items=weight_items,
+                    mapping=weight_mapping,
+                    title="重量段定义表",
+                )
+                tariff_df = read_and_map_multi_with_progress(
+                    items=tariff_items,
+                    mapping=tariff_mapping,
+                    title="多条件资费表",
+                )
+                yubao_map_df = read_and_map_multi_with_progress(
+                    items=yubao_map_items,
+                    mapping=yubao_mapping,
+                    title="云宝名称货品表",
+                )
+                consumable_df = read_and_map_multi_with_progress(
+                    items=consumable_items,
+                    mapping=consumable_mapping,
+                    title="耗材表",
+                )
+                tear_df = read_and_map_multi_with_progress(
+                    items=tear_items,
+                    mapping=tear_mapping,
+                    title="撕单表",
+                )
+                after_df = read_and_map_multi_with_progress(
+                    items=after_items,
+                    mapping=after_mapping,
+                    title="售后赔付表",
+                )
 
             if bill_df is None or bill_df.empty:
                 st.error("云仓账单为空，无法对账")
@@ -617,25 +1071,52 @@ def main():
         st.subheader("1) 多仓快递费汇总（基于多个对账结果表）")
         st.caption("上传多个对账结果文件，选择字段后导出汇总表。")
 
-        reconcile_items, reconcile_cols = file_uploader_multi_block(
+        st.markdown("**字段对账（简化版）**")
+        st.caption(
+            "上传前请先在源表中手动把列名规范化为标准字段名（本工具不会自动清洗/改列名）。"
+            "上传后仅提示哪些字段未命中；全部命中后才能生成导出。"
+        )
+
+        mw_extra_std = st.text_input(
+            "新增规范字段（逗号或换行分隔，可选）",
+            value="",
+            key="mw_std_extra",
+            help="例如：体积重量、SKU名称等。",
+        )
+        mw_std_all = _unique_keep_order(MULTI_STANDARD_FIELDS + _parse_csv_fields(mw_extra_std))
+
+        mw_selected_std = ordered_multiselect(
+            "选择需要对账/导出的规范字段（按勾选先后顺序导出）",
+            options=mw_std_all,
+            default=[
+                "云仓",
+                "物流单号",
+                "店铺名称",
+                "收货省份",
+                "结算重量(取整)",
+                "账单快递费",
+            ],
+            key="mw_std_fields",
+        )
+
+        reconcile_items_named, reconcile_cols = file_uploader_multi_block_named(
             "对账结果文件（可多选）",
             "mw_reconcile_files",
         )
 
-        default_fields = [
-            "云仓",
-            "物流单号",
-            "店铺名称",
-            "收货省份",
-            "结算重量(取整)",
-            "账单快递费",
-        ]
-        selected_fields = st.multiselect(
-            "选择导出字段（默认已预选 6 个字段）",
-            options=reconcile_cols,
-            default=[c for c in default_fields if c in reconcile_cols],
-            key="mw_summary_fields",
-        )
+        reconcile_missing_by_file: Dict[str, List[str]] = {}
+        if reconcile_items_named and mw_selected_std:
+            for _file_bytes, sheet, name, _engine, cols in reconcile_items_named:
+                display_name = f"{name}::{sheet}"
+                missing = build_per_file_hit_status_ui(
+                    file_name=display_name,
+                    file_cols=cols,
+                    standard_fields_ordered=mw_selected_std,
+                )
+                if missing:
+                    reconcile_missing_by_file[display_name] = missing
+
+        selected_fields = list(mw_selected_std)
 
         max_rows_per_sheet = st.number_input(
             "分页阈值（行数，超过则按云仓分页导出）",
@@ -646,19 +1127,38 @@ def main():
         )
 
         if st.button("生成多仓汇总表", type="primary", key="mw_build_summary"):
-            if not reconcile_items:
+            if not reconcile_items_named:
                 st.error("请先上传至少一个对账结果文件")
                 return
             if not selected_fields:
                 st.error("请至少选择 1 个导出字段")
                 return
-            df_all = read_multi_excel(reconcile_items)
+
+            if reconcile_missing_by_file:
+                lines = [f"- {name}：{ '、'.join(miss) }" for name, miss in reconcile_missing_by_file.items()]
+                st.error("以下文件字段未全部命中，请先修改源表列名后重新上传：\n" + "\n".join(lines))
+                return
+
+            try:
+                progress = st.progress(0)
+                status = st.empty()
+                dfs: List[pd.DataFrame] = []
+                total = len(reconcile_items_named)
+                usecols = tuple(selected_fields)
+                for idx, (b, s, n, e, _c) in enumerate(reconcile_items_named, start=1):
+                    status.write(f"正在读取明细数据：{n}::{s}（{idx}/{total}）")
+                    dfs.append(load_excel_usecols(b, s, e, usecols))
+                    progress.progress(min(1.0, idx / max(1, total)))
+                status.empty()
+                df_all = pd.concat(dfs, ignore_index=True)
+            except KeyError as e:
+                st.error(f"生成失败：存在未命中的字段（请先修改源表列名后重新上传）。错误：{e}")
+                return
             if df_all is None or df_all.empty:
                 st.error("读取结果为空，请检查所选 Sheet")
                 return
 
-            df_all = ensure_columns(df_all, selected_fields)
-            export_df = df_all.loc[:, selected_fields].copy()
+            export_df = df_all.copy()
 
             st.subheader("多仓汇总预览")
             st.dataframe(export_df.head(200), use_container_width=True)
@@ -685,11 +1185,11 @@ def main():
         st.subheader("2) 回冲差异分析（新复核结果 vs 旧汇总表）")
         st.caption("按物流单号汇总快递费等字段，对比新旧差异，导出回冲差异表。")
 
-        new_items, new_cols = file_uploader_multi_block(
+        new_items_named, new_cols = file_uploader_multi_block_named(
             "新复核结果表（可多选）",
             "mw_recharge_new",
         )
-        old_bytes, old_sheet, old_cols = file_uploader_block(
+        old_items_named, old_cols = file_uploader_block(
             "旧汇总表（手动上传）",
             "mw_recharge_old",
         )
@@ -711,19 +1211,84 @@ def main():
             key="mw_recharge_compare_fields",
         )
 
+        # Hit-check for recharge (only show missing; no manual mapping)
+        key_col = "物流单号"
+        recharge_required = [key_col] + list(compare_fields)
+        new_missing_by_file: Dict[str, List[str]] = {}
+        if new_items_named and recharge_required:
+            for _file_bytes, sheet, name, _engine, cols in new_items_named:
+                display_name = f"{name}::{sheet}"
+                missing = build_per_file_hit_status_ui(
+                    file_name=display_name,
+                    file_cols=cols,
+                    standard_fields_ordered=recharge_required,
+                )
+                if missing:
+                    new_missing_by_file[display_name] = missing
+
+        old_missing_by_file: Dict[str, List[str]] = {}
+        if old_items_named and recharge_required:
+            for _file_bytes, sheet, name, _engine, cols in old_items_named:
+                display_name = f"{name}::{sheet}"
+                missing = build_per_file_hit_status_ui(
+                    file_name=f"旧汇总/{display_name}",
+                    file_cols=cols,
+                    standard_fields_ordered=recharge_required,
+                )
+                if missing:
+                    old_missing_by_file[display_name] = missing
+
         if st.button("生成回冲差异表", type="primary", key="mw_build_recharge"):
-            if not new_items:
+            if not new_items_named:
                 st.error("请上传新复核结果表")
                 return
-            if not old_bytes or not old_sheet:
+            if not old_items_named:
                 st.error("请上传旧汇总表")
                 return
             if not compare_fields:
                 st.error("请至少选择 1 个对比字段")
                 return
 
-            new_df = read_multi_excel(new_items)
-            old_df = read_df(old_bytes, old_sheet)
+            if new_missing_by_file or old_missing_by_file:
+                lines: List[str] = []
+                if new_missing_by_file:
+                    lines += [f"- 新复核/{name}：{ '、'.join(miss) }" for name, miss in new_missing_by_file.items()]
+                if old_missing_by_file:
+                    lines += [f"- 旧汇总/{name}：{ '、'.join(miss) }" for name, miss in old_missing_by_file.items()]
+                st.error("字段未全部命中，请先修改源表列名后重新上传：\n" + "\n".join(lines))
+                return
+
+            try:
+                progress = st.progress(0)
+                status = st.empty()
+                dfs_new: List[pd.DataFrame] = []
+                total = len(new_items_named)
+                usecols = tuple(recharge_required)
+                for idx, (b, s, n, e, _c) in enumerate(new_items_named, start=1):
+                    status.write(f"正在读取新复核明细：{n}::{s}（{idx}/{total}）")
+                    dfs_new.append(load_excel_usecols(b, s, e, usecols))
+                    progress.progress(min(1.0, idx / max(1, total)))
+                status.empty()
+                new_df = pd.concat(dfs_new, ignore_index=True)
+            except KeyError as e:
+                st.error(f"新复核结果缺少必需字段（请先修改源表列名后重新上传）。错误：{e}")
+                return
+
+            try:
+                progress_old = st.progress(0)
+                status_old = st.empty()
+                dfs_old: List[pd.DataFrame] = []
+                total_old = len(old_items_named)
+                usecols_old = tuple(recharge_required)
+                for idx, (b, s, n, e, _c) in enumerate(old_items_named, start=1):
+                    status_old.write(f"正在读取旧汇总明细：{n}::{s}（{idx}/{total_old}）")
+                    dfs_old.append(load_excel_usecols(b, s, e, usecols_old))
+                    progress_old.progress(min(1.0, idx / max(1, total_old)))
+                status_old.empty()
+                old_df = pd.concat(dfs_old, ignore_index=True)
+            except Exception as e:
+                st.error(f"旧汇总表读取失败（请确认文件未损坏，且列名已规范化）。错误：{e}")
+                return
             if new_df is None or new_df.empty:
                 st.error("新复核结果读取为空，请检查所选 Sheet")
                 return
@@ -731,13 +1296,9 @@ def main():
                 st.error("旧汇总表读取为空，请检查所选 Sheet")
                 return
 
-            key_col = "物流单号"
             if key_col not in new_df.columns or key_col not in old_df.columns:
-                st.error("新旧表均需包含列：物流单号")
+                st.error("新旧表均需包含列：物流单号。请在源表中把列名改为“物流单号”后重新上传。")
                 return
-
-            new_df = ensure_columns(new_df, [key_col] + compare_fields)
-            old_df = ensure_columns(old_df, [key_col] + compare_fields)
 
             new_agg = aggregate_by_key_sum(new_df, key_col=key_col, value_cols=compare_fields)
             old_agg = aggregate_by_key_sum(old_df, key_col=key_col, value_cols=compare_fields)
@@ -777,19 +1338,14 @@ def main():
         st.subheader("快递费分析")
         st.caption("上传单个云仓的对账结果表，生成省份透视、TOP单品、重量单价表，并导出Excel。")
 
-        analysis_bytes, analysis_sheet, analysis_cols = file_uploader_block(
-            "对账结果表（单文件）",
+        analysis_items, analysis_cols = file_uploader_block(
+            "对账结果表（单文件，可多选Sheet）",
             "analysis_file",
         )
-        if not analysis_bytes or not analysis_sheet:
+        if not analysis_items:
             st.info("请先上传对账结果表")
-            analysis_df = None
-        else:
-            analysis_df = read_df(analysis_bytes, analysis_sheet)
-
-        if analysis_df is None or analysis_df.empty:
-            if analysis_bytes and analysis_sheet:
-                st.error("对账结果表为空，请检查所选 Sheet")
+        elif not analysis_cols:
+            st.error("读取表头失败：未获取到字段列名")
         else:
             st.subheader("字段选择")
             col_left, col_right = st.columns([1, 1])
@@ -852,6 +1408,34 @@ def main():
             )
 
             if st.button("生成分析", type="primary", key="analysis_run"):
+                if not analysis_items:
+                    st.error("请先上传对账结果表")
+                    return
+
+                try:
+                    if len(analysis_items) == 1:
+                        with st.spinner("正在读取明细数据..."):
+                            with st.spinner("正在读取对账结果表..."):
+                                analysis_df = read_df_items_with_progress(items=analysis_items, title="对账结果表")
+                    else:
+                        progress = st.progress(0)
+                        status = st.empty()
+                        dfs: List[pd.DataFrame] = []
+                        total = len(analysis_items)
+                        for idx, (b, s, n, e, _c) in enumerate(analysis_items, start=1):
+                            status.write(f"正在读取明细数据：{n}::{s}（{idx}/{total}）")
+                            dfs.append(load_excel(b, s, engine=e))
+                            progress.progress(min(1.0, idx / max(1, total)))
+                        status.empty()
+                        analysis_df = pd.concat(dfs, ignore_index=True) if dfs else None
+                except Exception as e:
+                    st.error(f"读取对账结果表失败：{e}")
+                    return
+
+                if analysis_df is None or analysis_df.empty:
+                    st.error("对账结果表为空，请检查所选 Sheet")
+                    return
+
                 missing = [
                     c
                     for c in [order_col, province_col, sku_col, weight_col, fee_col]
@@ -914,17 +1498,12 @@ def main():
             "根据结果表生成汇总账单（序号/项目/金额/余额）。期初余额与本月预充支持手动输入或从WPS多维表API获取。"
         )
 
-        bill_bytes, bill_sheet, bill_cols = file_uploader_block(
-            "结果表（单文件，可选任意Sheet）",
+        bill_items, bill_cols = file_uploader_block(
+            "结果表（单文件，可多选Sheet）",
             "bill_summary_file",
         )
-        if not bill_bytes or not bill_sheet:
+        if not bill_items:
             st.info("请先上传结果表")
-            return
-
-        result_df = read_df(bill_bytes, bill_sheet)
-        if result_df is None or result_df.empty:
-            st.error("结果表为空，请检查所选 Sheet")
             return
 
         st.subheader("1) 期初余额")
@@ -1085,6 +1664,30 @@ def main():
         st.divider()
 
         if st.button("生成汇总账单", type="primary", key="bill_build"):
+            try:
+                if len(bill_items) == 1:
+                    with st.spinner("正在读取明细数据..."):
+                        with st.spinner("正在读取结果表..."):
+                            result_df = read_df_items_with_progress(items=bill_items, title="结果表")
+                else:
+                    progress = st.progress(0)
+                    status = st.empty()
+                    dfs: List[pd.DataFrame] = []
+                    total = len(bill_items)
+                    for idx, (b, s, n, e, _c) in enumerate(bill_items, start=1):
+                        status.write(f"正在读取明细数据：{n}::{s}（{idx}/{total}）")
+                        dfs.append(load_excel(b, s, engine=e))
+                        progress.progress(min(1.0, idx / max(1, total)))
+                    status.empty()
+                    result_df = pd.concat(dfs, ignore_index=True) if dfs else None
+            except Exception as e:
+                st.error(f"读取结果表失败：{e}")
+                return
+
+            if result_df is None or result_df.empty:
+                st.error("结果表为空，请检查所选 Sheet")
+                return
+
             if not isinstance(items_df, pd.DataFrame) or items_df.empty:
                 st.error("请先选择至少 1 个需要合计的字段")
                 return

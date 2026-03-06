@@ -23,7 +23,19 @@ REQUIRED_COLUMNS = {
     "yubao_map": ["货品名称", "商家编码"],
     "maozhong": ["商家编码", "毛重(g)", "箱规"],
     "weight_segments": ["云仓", "重量段结束(kg)"],
-    "tariff": ["云仓", "快递公司", "重量段结束(kg)", "是否打包品", "省份", "生效开始日期", "生效结束日期"],
+    "tariff": [
+        "云仓",
+        "快递公司",
+        "重量段结束(kg)",
+        "是否打包品",
+        "省份",
+        "首重(kg)",
+        "首费(元)",
+        "续重(kg)",
+        "续费(元)",
+        "生效开始日期",
+        "生效结束日期",
+    ],
     "bill": ["物流单号", "计费重量(kg)", "快递费(元)", "云仓"],
     "consumables": ["商家编码", "价格(元)"],
     "tear": ["物流单号"],
@@ -160,31 +172,112 @@ def compute_settlement_weight(
     for seg in segments:
         if weight <= seg:
             return seg
-    return segments[-1]
+    # If actual weight exceeds the maximum segment, keep the original weight.
+    # This enables overweight pricing rules (重量段结束(kg)=0) to kick in.
+    return float(weight)
+
+
+def _coerce_tariff_schema(tariff_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize tariff schema to new fields.
+
+    New schema expects: 首重(kg), 首费(元), 续重(kg), 续费(元).
+    For backward compatibility, if 首费(元) is missing but 快递费(元)/快递费 exists,
+    use it as 首费(元), and default the rest to 0.
+    """
+
+    df = tariff_df.copy()
+
+    if "首费(元)" not in df.columns:
+        if "快递费(元)" in df.columns:
+            df["首费(元)"] = df["快递费(元)"]
+        elif "快递费" in df.columns:
+            df["首费(元)"] = df["快递费"]
+        elif "首重价格" in df.columns:
+            df["首费(元)"] = df["首重价格"]
+
+    for col in ["首重(kg)", "续重(kg)", "续费(元)"]:
+        if col not in df.columns:
+            df[col] = 0
+
+    for col in ["重量段结束(kg)", "首重(kg)", "首费(元)", "续重(kg)", "续费(元)"]:
+        if col in df.columns:
+            df[col] = ensure_numeric(df[col])
+
+    return df
 
 
 def match_tariff(order: pd.Series, tariff_df: pd.DataFrame) -> Optional[pd.Series]:
-    candidates = tariff_df[
-        (tariff_df["云仓"] == order["云仓"])
-        & (tariff_df["快递公司"] == order["快递公司"])
-        & (tariff_df["重量段结束(kg)"] == order["结算重量(取整)"])
-        & ((tariff_df["省份"] == order["收货省份"]) | (tariff_df["省份"] == "*"))
-        & (
-            (tariff_df["是否打包品"] == order["是否打包品"])
-            | (tariff_df["是否打包品"] == "全包")
-        )
-        & (tariff_df["生效开始日期"] <= order["发货时间"])
-        & (tariff_df["生效结束日期"] >= order["发货时间"])
-    ]
+    """Match tariff by (云仓/快递/是否打包品/省份/生效期) and weight rule.
+
+    Weight logic:
+    - Prefer non-zero segments: choose the smallest 重量段结束(kg) >= w
+    - If no non-zero segment covers w, fall back to 重量段结束(kg)=0 (overweight rule)
+    """
+
+    df = tariff_df
+    w = float(order.get("结算重量(取整)") or 0)
+
+    candidates = df[
+        (df["云仓"] == order["云仓"])
+        & (df["快递公司"] == order["快递公司"])
+        & ((df["省份"] == order["收货省份"]) | (df["省份"] == "*"))
+        & ((df["是否打包品"] == order["是否打包品"]) | (df["是否打包品"] == "全包"))
+        & (df["生效开始日期"] <= order["发货时间"])
+        & (df["生效结束日期"] >= order["发货时间"])
+    ].copy()
+
     if candidates.empty:
         return None
-    candidates = candidates.sort_values("生效开始日期", ascending=False)
-    return candidates.iloc[0]
+
+    candidates["_province_exact"] = candidates["省份"] == order["收货省份"]
+    candidates["_pack_exact"] = candidates["是否打包品"] == order["是否打包品"]
+    candidates["_weight_end"] = ensure_numeric(candidates["重量段结束(kg)"]).fillna(0)
+
+    # Try covered segment first (weight_end > 0 and >= w).
+    covered = candidates[(candidates["_weight_end"] > 0) & (candidates["_weight_end"] >= w)]
+    if not covered.empty:
+        min_end = float(covered["_weight_end"].min())
+        covered = covered[covered["_weight_end"] == min_end]
+        covered = covered.sort_values(
+            ["_province_exact", "_pack_exact", "生效开始日期"],
+            ascending=[False, False, False],
+        )
+        return covered.iloc[0]
+
+    # Fall back to overweight rule (weight_end == 0).
+    overweight = candidates[candidates["_weight_end"] == 0]
+    if overweight.empty:
+        return None
+    overweight = overweight.sort_values(
+        ["_province_exact", "_pack_exact", "生效开始日期"],
+        ascending=[False, False, False],
+    )
+    return overweight.iloc[0]
 
 
 def calculate_tariff_fee(order: pd.Series, matched: Optional[pd.Series]) -> Tuple[float, str]:
     if matched is None:
         return 0.0, "未匹配资费"
+
+    # New schema.
+    if "首费(元)" in matched.index and pd.notna(matched.get("首费(元)")):
+        weight_end = float(matched.get("重量段结束(kg)") or 0)
+        base_fee = float(matched.get("首费(元)") or 0)
+        if weight_end and weight_end > 0:
+            return base_fee, ""
+
+        w = float(order.get("结算重量(取整)") or 0)
+        base_weight = float(matched.get("首重(kg)") or 0)
+        step_weight = float(matched.get("续重(kg)") or 0)
+        step_fee = float(matched.get("续费(元)") or 0)
+
+        if w <= base_weight or step_weight <= 0 or step_fee == 0:
+            return base_fee, ""
+
+        extra_units = int(np.ceil(max(0.0, w - base_weight) / step_weight))
+        return base_fee + extra_units * step_fee, ""
+
+    # Legacy fallback.
     if "快递费(元)" in matched.index and pd.notna(matched.get("快递费(元)")):
         return float(matched.get("快递费(元)")), ""
     if "快递费" in matched.index and pd.notna(matched.get("快递费")):
@@ -337,6 +430,7 @@ def reconcile_main(
     )
 
     tariff_df = tariff_df.copy()
+    tariff_df = _coerce_tariff_schema(tariff_df)
     tariff_df["生效开始日期"] = safe_to_datetime(tariff_df["生效开始日期"])
     tariff_df["生效结束日期"] = safe_to_datetime(tariff_df["生效结束日期"])
 
