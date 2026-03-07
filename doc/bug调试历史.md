@@ -200,6 +200,25 @@
   - 如何避免/加固：
     - 后续新增模块一律复用统一的 Excel 导入能力，不再单独写一套上传/读取逻辑。
 
+  ---
+
+  ## 12) 2026-03-07：拖拽字段映射弹窗报 ValueError（multi_containers 入参格式不符）
+
+  - 模块/入口：主对账字段映射（`app.py` → `draggable_mapping_ui()` → `streamlit_sortables.sort_items()`）
+  - 现象：
+    - 打开“拖拽映射（模态对话框）”后页面报错：
+      - `ValueError: items must be list[dict[str, Any]] if multi_containers is True.`
+  - 原因：
+    - `streamlit-sortables` 在 `multi_containers=True` 时，要求 `items` 必须为 `[{header: str, items: list}, ...]`。
+    - 在某些 rerun / session_state 状态下，传参可能退化为 dict 或其它形态，触发组件的严格校验。
+  - 解决办法：
+    - 在 [app.py](../app.py) 增加入参清洗函数 `_sanitize_sortables_multi_containers()`：
+      - 无论上游传入何种形态，进入组件前都转换为合法的 list-of-dict。
+    - 同时关闭字段项的 hover 宽度/特效（禁用 transition/transform，透明边框 + border-box）以避免悬浮闪烁。
+  - 如何避免/加固：
+    - 对所有 `sort_items(multi_containers=True)` 调用点统一做入参规范化。
+    - UI 样式避免“悬浮改变尺寸”的效果（会造成闪烁、影响拖拽手感）。
+
 ---
 
 ## 记录模板（复制一条新增）

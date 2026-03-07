@@ -7,6 +7,11 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
+try:
+    from streamlit_sortables import sort_items as _sort_items
+except Exception:  # pragma: no cover
+    _sort_items = None
+
 from reconcile import (
     REQUIRED_COLUMNS,
     ReconcileConfig,
@@ -533,6 +538,356 @@ def mapping_duplicates(mapping: Dict[str, str]) -> List[str]:
     return sorted({val for val in values if values.count(val) > 1})
 
 
+def required_mapping_missing(required_cols: List[str], mapping: Dict[str, str]) -> List[str]:
+    """Return required standard fields that are not mapped to any source column."""
+
+    if not required_cols:
+        return []
+    mapped = set(mapping.keys())
+    return [c for c in required_cols if c not in mapped]
+
+
+def effective_required_cols(key_prefix: str, default_required: List[str]) -> List[str]:
+    """Per-data-source required field override.
+
+    Users can customize required standard fields in checklist_mapping_ui.
+    """
+
+    override = st.session_state.get(f"{key_prefix}_required_override")
+    if override is None:
+        return list(default_required or [])
+    if isinstance(override, list):
+        return [str(x) for x in override if str(x).strip()]
+    return list(default_required or [])
+
+
+def _normalize_all_items_state(
+    *,
+    all_items: List[str],
+    prev_all_order: Optional[List[str]],
+    prev_checked_order: Optional[List[str]],
+) -> Tuple[List[str], List[str]]:
+    """Return (all_order, checked_order) consistent with current all_items.
+
+    - Keeps previous ordering where possible
+    - Drops items that disappeared
+    - Appends new items at end
+    """
+
+    all_set = set(all_items)
+
+    ordered_all: List[str] = []
+    for x in (prev_all_order or []):
+        if x in all_set and x not in ordered_all:
+            ordered_all.append(x)
+    for x in all_items:
+        if x not in ordered_all:
+            ordered_all.append(x)
+
+    checked: List[str] = []
+    for x in (prev_checked_order or []):
+        if x in all_set and x not in checked:
+            checked.append(x)
+
+    # Ensure checked items appear in all-order
+    checked = [x for x in checked if x in set(ordered_all)]
+    return ordered_all, checked
+
+
+def _containers_from_checked(all_order: List[str], checked_order: List[str]) -> List[Dict[str, object]]:
+        """Build streamlit-sortables multi_containers input.
+
+        Expected format (per component implementation):
+            [
+                {'header': '已勾选', 'items': [...]},
+                {'header': '未勾选', 'items': [...]},
+            ]
+        """
+
+        checked_set = set(checked_order)
+        checked = [x for x in checked_order if x in set(all_order)]
+        unchecked = [x for x in all_order if x not in checked_set]
+        return [
+                {"header": "已勾选", "items": checked},
+                {"header": "未勾选", "items": unchecked},
+        ]
+
+
+def _checked_from_containers(containers: object) -> Tuple[List[str], List[str]]:
+    """Parse streamlit-sortables multi_containers return to (all_order, checked_order)."""
+
+    # Expected: list[{'header': str, 'items': list[str]}]
+    if isinstance(containers, list) and all(isinstance(x, dict) for x in containers):
+        header_to_items: Dict[str, List[str]] = {}
+        for c in containers:
+            header = str(c.get("header", ""))
+            items = c.get("items", [])
+            if isinstance(items, list):
+                header_to_items[header] = [str(i) for i in items]
+        checked = header_to_items.get("已勾选", [])
+        unchecked = header_to_items.get("未勾选", [])
+        all_order = checked + unchecked
+        return all_order, checked
+
+    # Fallback: treat as single list where everything is checked
+    if isinstance(containers, list):
+        all_order = [str(x) for x in containers]
+        return all_order, list(all_order)
+    return [], []
+
+
+def _sanitize_sortables_multi_containers(containers: object) -> List[Dict[str, object]]:
+    """Ensure the input for streamlit_sortables.sort_items(multi_containers=True) is valid."""
+
+    if isinstance(containers, list) and all(isinstance(x, dict) for x in containers):
+        out: List[Dict[str, object]] = []
+        for c in containers:
+            header = str(c.get("header", ""))
+            items = c.get("items", [])
+            if not isinstance(items, list):
+                items = []
+            out.append({"header": header, "items": [str(x) for x in items]})
+        return out
+
+    # If a dict mapping is provided, convert it.
+    if isinstance(containers, dict):
+        out = []
+        for k, v in containers.items():
+            items = v if isinstance(v, list) else []
+            out.append({"header": str(k), "items": [str(x) for x in items]})
+        return out
+
+    # Anything else: return empty containers
+    return [{"header": "已勾选", "items": []}, {"header": "未勾选", "items": []}]
+
+
+def draggable_mapping_ui(
+    title: str,
+    available_cols: List[str],
+    base_standard_fields: List[str],
+    required_cols: Optional[List[str]],
+    key_prefix: str,
+    preset: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, str], List[str], List[str]]:
+    """方案B：模态框 + 两栏 + 勾选(自动前置) + 拖拽排序（轻量依赖 streamlit-sortables）。
+
+    - 左栏：源字段（显示全部，可勾选；勾选项自动前置；支持拖拽排序）
+    - 右栏：规范字段（显示全部；默认勾选=必填字段，按默认顺序；支持拖拽排序）
+    """
+
+    if not available_cols:
+        return {}, [], base_standard_fields
+
+    standard_fields = _unique_keep_order(list(base_standard_fields))
+
+    # If the drag component is not available, fall back to scheme A.
+    if _sort_items is None:
+        return checklist_mapping_ui(
+            title=title,
+            available_cols=available_cols,
+            base_standard_fields=standard_fields,
+            required_cols=required_cols,
+            key_prefix=key_prefix,
+            preset=preset,
+        )
+
+    preset = preset or {}
+
+    # Required override (still supported)
+    required_override_key = f"{key_prefix}_required_override"
+    required_default = [x for x in list(required_cols or []) if x in set(standard_fields)]
+    required_prev = st.session_state.get(required_override_key, required_default)
+    if not isinstance(required_prev, list):
+        required_prev = required_default
+    required_prev = [str(x) for x in required_prev]
+    required_prev = [x for x in required_prev if x in set(standard_fields)]
+
+    # State
+    state_key = f"{key_prefix}__drag_state"
+    if state_key not in st.session_state:
+        # Initialize from preset mapping if possible
+        preset_targets = [t for t in standard_fields if t in set(preset.keys())]
+        preset_sources = [preset.get(t, "") for t in preset_targets]
+        preset_sources = [s for s in preset_sources if s in set(available_cols)]
+
+        src_all_order, src_checked = _normalize_all_items_state(
+            all_items=list(available_cols),
+            prev_all_order=list(available_cols),
+            prev_checked_order=preset_sources,
+        )
+
+        tgt_all_order, tgt_checked = _normalize_all_items_state(
+            all_items=list(standard_fields),
+            prev_all_order=list(standard_fields),
+            prev_checked_order=preset_targets or required_prev,
+        )
+
+        st.session_state[state_key] = {
+            "src_all": src_all_order,
+            "src_checked": src_checked,
+            "tgt_all": tgt_all_order,
+            "tgt_checked": tgt_checked,
+            "src_sig": tuple(available_cols),
+            "tgt_sig": tuple(standard_fields),
+        }
+    else:
+        state = st.session_state[state_key]
+        if tuple(state.get("src_sig", ())) != tuple(available_cols):
+            src_all_order, src_checked = _normalize_all_items_state(
+                all_items=list(available_cols),
+                prev_all_order=state.get("src_all"),
+                prev_checked_order=state.get("src_checked"),
+            )
+            state["src_all"], state["src_checked"], state["src_sig"] = (
+                src_all_order,
+                src_checked,
+                tuple(available_cols),
+            )
+        if tuple(state.get("tgt_sig", ())) != tuple(standard_fields):
+            tgt_all_order, tgt_checked = _normalize_all_items_state(
+                all_items=list(standard_fields),
+                prev_all_order=state.get("tgt_all"),
+                prev_checked_order=state.get("tgt_checked"),
+            )
+            state["tgt_all"], state["tgt_checked"], state["tgt_sig"] = (
+                tgt_all_order,
+                tgt_checked,
+                tuple(standard_fields),
+            )
+        st.session_state[state_key] = state
+
+    with st.expander(f"{title}字段映射（拖拽）", expanded=False):
+        st.caption("在模态框中左右拖拽排序；已勾选项自动前置。")
+
+        required_override = st.multiselect(
+            "必填规范字段（可自定义）",
+            options=standard_fields,
+            default=required_prev,
+            key=required_override_key,
+        )
+        required_set = set(required_override or [])
+
+        state = st.session_state[state_key]
+        src_checked_cnt = len(state.get("src_checked", []))
+        tgt_checked_cnt = len(state.get("tgt_checked", []))
+        st.write(f"已勾选：源字段 {src_checked_cnt} 个；规范字段 {tgt_checked_cnt} 个")
+
+        # Widen dialogs a bit (same approach as before)
+        dialog_decorator = getattr(st, "dialog", None)
+        if callable(dialog_decorator):
+            st.markdown(
+                """
+                <style>
+                div[data-testid="stDialog"] > div[role="dialog"] {
+                    width: 95vw;
+                    max-width: 1600px;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        custom_style = """
+        .sortable-component { width: 100%; }
+        .sortable-container { box-sizing: border-box; border: 1px solid rgba(49,51,63,0.2); border-radius: 8px; padding: 6px; margin-bottom: 8px; }
+        .sortable-container-header { font-weight: 600; margin-bottom: 6px; }
+        .sortable-item { box-sizing: border-box; width: 100%; padding: 6px 8px; border-radius: 6px; border: 1px solid transparent; transition: none !important; box-shadow: none !important; transform: none !important; }
+        .sortable-item:hover, .sortable-item:active, .sortable-item:focus { border-color: transparent !important; transition: none !important; box-shadow: none !important; transform: none !important; }
+        """
+
+        def _render_drag_lists() -> None:
+            dstate = st.session_state.get(state_key, {})
+
+            left, right = st.columns([1, 1])
+            with left:
+                st.markdown("**源字段**")
+                st.caption("勾选=加入‘已勾选’；拖拽可调整顺序/在两区之间移动。")
+
+                src_containers = _containers_from_checked(
+                    dstate.get("src_all", list(available_cols)),
+                    dstate.get("src_checked", []),
+                )
+                src_sorted = _sort_items(
+                    _sanitize_sortables_multi_containers(src_containers),
+                    multi_containers=True,
+                    direction="vertical",
+                    custom_style=custom_style,
+                    key=f"{key_prefix}_src_sort",
+                )
+                src_all, src_checked = _checked_from_containers(src_sorted)
+                dstate["src_all"], dstate["src_checked"] = src_all, src_checked
+
+            with right:
+                st.markdown("**规范字段**")
+                st.caption("默认勾选必填字段；拖拽可调整顺序/在两区之间移动。")
+
+                # Ensure required are selected by default (but still user-editable)
+                tgt_checked = dstate.get("tgt_checked", [])
+                if not tgt_checked:
+                    tgt_checked = [x for x in standard_fields if x in required_set]
+
+                tgt_containers = _containers_from_checked(
+                    dstate.get("tgt_all", list(standard_fields)),
+                    tgt_checked,
+                )
+                tgt_sorted = _sort_items(
+                    _sanitize_sortables_multi_containers(tgt_containers),
+                    multi_containers=True,
+                    direction="vertical",
+                    custom_style=custom_style,
+                    key=f"{key_prefix}_tgt_sort",
+                )
+                tgt_all, tgt_checked_new = _checked_from_containers(tgt_sorted)
+                dstate["tgt_all"], dstate["tgt_checked"] = tgt_all, tgt_checked_new
+
+            st.session_state[state_key] = dstate
+
+        if callable(dialog_decorator):
+            @st.dialog(f"{title}字段映射（拖拽）")
+            def _drag_dialog() -> None:
+                st.caption("拖拽排序并在‘已勾选/未勾选’间移动；关闭后会保留结果。")
+                _render_drag_lists()
+                if st.button("完成并关闭"):
+                    st.rerun()
+
+            if st.button("打开拖拽映射（模态对话框）"):
+                _drag_dialog()
+        else:
+            st.info("当前 Streamlit 版本不支持模态对话框，将以内嵌方式显示拖拽列表。")
+            _render_drag_lists()
+
+        # Build mapping from checked orders
+        state_now = st.session_state.get(state_key, {})
+        sources_ordered = [x for x in state_now.get("src_checked", []) if x in set(available_cols)]
+        targets_ordered = [x for x in state_now.get("tgt_checked", []) if x in set(standard_fields)]
+
+        if required_set and not required_set.issubset(set(targets_ordered)):
+            missing_req = [x for x in list(required_set) if x not in set(targets_ordered)]
+            st.warning(f"有必填规范字段未勾选：{missing_req}")
+
+        if sources_ordered and targets_ordered and len(sources_ordered) != len(targets_ordered):
+            st.warning(
+                f"源字段数量({len(sources_ordered)})与规范字段数量({len(targets_ordered)})不一致，将按最短长度配对。"
+            )
+
+        mapping: Dict[str, str] = {}
+        for t, s in zip(targets_ordered, sources_ordered):
+            if t and s:
+                mapping[str(t)] = str(s)
+
+        dup_sources = mapping_duplicates(mapping)
+        if dup_sources:
+            st.warning(f"检测到重复映射（多个规范字段指向同一源字段）：{dup_sources}")
+
+        if mapping:
+            preview_rows = [{"规范字段": k, "源表字段": v} for k, v in mapping.items()]
+            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("尚未生成映射：请打开模态框勾选并拖拽排序。")
+
+    return mapping, [], standard_fields
+
+
 def _parse_csv_fields(text: str) -> List[str]:
     if not text:
         return []
@@ -555,6 +910,352 @@ def _unique_keep_order(items: List[str]) -> List[str]:
         seen.add(item)
         out.append(item)
     return out
+
+
+def _coerce_int_or_none(val: object) -> Optional[int]:
+    if val is None:
+        return None
+    if isinstance(val, int):
+        return int(val) if val > 0 else None
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+    try:
+        ival = int(float(str(val).strip()))
+        return ival if ival > 0 else None
+    except Exception:
+        return None
+
+
+def _normalize_order_state(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    """Normalize checklist state.
+
+    Each row uses keys: field(str), selected(bool), order(Optional[int]).
+    - Clears order for deselected rows
+    - Ensures selected rows have unique sequential order 1..n
+    """
+
+    cleaned: List[Dict[str, object]] = []
+    for r in rows:
+        field = str(r.get("field", ""))
+        selected = bool(r.get("selected", False))
+        order = _coerce_int_or_none(r.get("order"))
+        cleaned.append({"field": field, "selected": selected, "order": order})
+
+    selected_rows = [r for r in cleaned if r["selected"]]
+    selected_rows_sorted = sorted(
+        selected_rows,
+        key=lambda r: (
+            r["order"] if r["order"] is not None else 10**9,
+            r["field"],
+        ),
+    )
+    for idx, r in enumerate(selected_rows_sorted, start=1):
+        r["order"] = idx
+
+    selected_set = {r["field"] for r in selected_rows_sorted}
+    out: List[Dict[str, object]] = []
+    for r in cleaned:
+        if r["field"] in selected_set:
+            nr = next(x for x in selected_rows_sorted if x["field"] == r["field"])
+            out.append(nr)
+        else:
+            out.append({"field": r["field"], "selected": False, "order": None})
+    return out
+
+
+def _rows_to_display_df(
+    rows: List[Dict[str, object]],
+    *,
+    required_fields: Optional[set[str]] = None,
+    add_required_col: bool = False,
+) -> pd.DataFrame:
+    required_fields = required_fields or set()
+    df = pd.DataFrame(
+        {
+            "选": [bool(r.get("selected", False)) for r in rows],
+            "顺序": [r.get("order") for r in rows],
+            "字段": [str(r.get("field", "")) for r in rows],
+        }
+    )
+    if add_required_col:
+        df.insert(2, "必填", [f in required_fields for f in df["字段"].tolist()])
+
+    df_sorted = df.sort_values(
+        by=["选", "顺序", "字段"],
+        ascending=[False, True, True],
+        na_position="last",
+        kind="mergesort",
+    )
+    return df_sorted.reset_index(drop=True)
+
+
+def _display_df_to_rows(df: pd.DataFrame) -> List[Dict[str, object]]:
+    if df is None or df.empty:
+        return []
+    out: List[Dict[str, object]] = []
+    for _, row in df.iterrows():
+        out.append(
+            {
+                "field": str(row.get("字段", "")),
+                "selected": bool(row.get("选", False)),
+                "order": _coerce_int_or_none(row.get("顺序")),
+            }
+        )
+    return out
+
+
+def checklist_mapping_ui(
+    title: str,
+    available_cols: List[str],
+    base_standard_fields: List[str],
+    required_cols: Optional[List[str]],
+    key_prefix: str,
+    preset: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, str], List[str], List[str]]:
+    """方案A：左右勾选列表 + 顺序配对（纯原生，不引入第三方依赖）。
+
+    Returns same tuple shape as bulk_mapping_ui: (mapping, missing_placeholder, standard_fields)
+    """
+
+    if not available_cols:
+        return {}, [], base_standard_fields
+
+    standard_fields = _unique_keep_order(list(base_standard_fields))
+    preset = preset or {}
+
+    state_key = f"{key_prefix}__checklist_state"
+    if state_key not in st.session_state:
+        preset_targets = [t for t in standard_fields if t in preset]
+        preset_sources = [preset.get(t, "") for t in preset_targets]
+        preset_sources = [s for s in preset_sources if s in set(available_cols)]
+        preset_sources_set = set(preset_sources)
+
+        targets_rows: List[Dict[str, object]] = []
+        for t in standard_fields:
+            targets_rows.append({"field": t, "selected": t in preset_targets, "order": None})
+
+        sources_rows: List[Dict[str, object]] = []
+        for s in available_cols:
+            sources_rows.append({"field": s, "selected": s in preset_sources_set, "order": None})
+
+        def _apply_initial_order(rows: List[Dict[str, object]], selected_order: List[str]) -> None:
+            order_map = {name: i + 1 for i, name in enumerate(selected_order)}
+            for r in rows:
+                if r["field"] in order_map:
+                    r["order"] = order_map[r["field"]]
+
+        _apply_initial_order(targets_rows, preset_targets)
+        _apply_initial_order(sources_rows, preset_sources)
+
+        st.session_state[state_key] = {
+            "targets": _normalize_order_state(targets_rows),
+            "sources": _normalize_order_state(sources_rows),
+            "targets_sig": tuple(standard_fields),
+            "sources_sig": tuple(available_cols),
+        }
+    else:
+        # If the uploaded sheet changes, available columns can change; refresh state to match.
+        state = st.session_state[state_key]
+        prev_targets_sig = tuple(state.get("targets_sig", ()))
+        prev_sources_sig = tuple(state.get("sources_sig", ()))
+
+        if prev_targets_sig != tuple(standard_fields):
+            old_rows = {str(r.get("field", "")): r for r in list(state.get("targets", []))}
+            rebuilt: List[Dict[str, object]] = []
+            for f in standard_fields:
+                old = old_rows.get(f)
+                rebuilt.append(
+                    {
+                        "field": f,
+                        "selected": bool(old.get("selected", False)) if old else False,
+                        "order": old.get("order") if old else None,
+                    }
+                )
+            state["targets"] = _normalize_order_state(rebuilt)
+            state["targets_sig"] = tuple(standard_fields)
+
+        if prev_sources_sig != tuple(available_cols):
+            old_rows = {str(r.get("field", "")): r for r in list(state.get("sources", []))}
+            rebuilt = []
+            for f in available_cols:
+                old = old_rows.get(f)
+                rebuilt.append(
+                    {
+                        "field": f,
+                        "selected": bool(old.get("selected", False)) if old else False,
+                        "order": old.get("order") if old else None,
+                    }
+                )
+            state["sources"] = _normalize_order_state(rebuilt)
+            state["sources_sig"] = tuple(available_cols)
+
+        st.session_state[state_key] = state
+
+    with st.expander(f"{title}字段映射（勾选列表）", expanded=False):
+        st.caption("点击按钮弹出勾选列表；左右勾选后按顺序一一配对生成映射。")
+
+        required_override_key = f"{key_prefix}_required_override"
+        required_override_default = list(required_cols or [])
+        required_override_default = [x for x in required_override_default if x in set(standard_fields)]
+        required_override_prev = st.session_state.get(required_override_key, required_override_default)
+        if not isinstance(required_override_prev, list):
+            required_override_prev = required_override_default
+        required_override_prev = [str(x) for x in required_override_prev]
+        required_override_prev = [x for x in required_override_prev if x in set(standard_fields)]
+        required_override = st.multiselect(
+            "必填规范字段（可自定义）",
+            options=standard_fields,
+            default=required_override_prev,
+            key=required_override_key,
+            help="可按当前业务口径调整必填字段；移除必填可能导致后续计算缺列报错。",
+        )
+        required_set = set(required_override or [])
+
+        state = st.session_state[state_key]
+        targets_rows = list(state.get("targets", []))
+        sources_rows = list(state.get("sources", []))
+
+        src_selected_cnt = sum(1 for r in sources_rows if bool(r.get("selected", False)))
+        tgt_selected_cnt = sum(1 for r in targets_rows if bool(r.get("selected", False)))
+        st.write(f"已勾选：源表字段 {src_selected_cnt} 个；规范字段 {tgt_selected_cnt} 个")
+
+        def _render_editors(current_sources_rows: List[Dict[str, object]], current_targets_rows: List[Dict[str, object]]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+            col_l, col_r = st.columns([1, 1])
+            with col_l:
+                st.markdown("**源表字段（勾选 + 顺序）**")
+                src_df_display = _rows_to_display_df(current_sources_rows)
+                src_df_edited_local = st.data_editor(
+                    src_df_display,
+                    key=f"{key_prefix}_src_editor",
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "选": st.column_config.CheckboxColumn(required=False),
+                        "顺序": st.column_config.NumberColumn(step=1, min_value=1),
+                        "字段": st.column_config.TextColumn(disabled=True),
+                    },
+                )
+            with col_r:
+                st.markdown("**规范字段（勾选 + 顺序）**")
+                tgt_df_display = _rows_to_display_df(
+                    current_targets_rows,
+                    required_fields=required_set,
+                    add_required_col=True,
+                )
+                tgt_df_edited_local = st.data_editor(
+                    tgt_df_display,
+                    key=f"{key_prefix}_tgt_editor",
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "选": st.column_config.CheckboxColumn(required=False),
+                        "必填": st.column_config.CheckboxColumn(disabled=True),
+                        "顺序": st.column_config.NumberColumn(step=1, min_value=1),
+                        "字段": st.column_config.TextColumn(disabled=True),
+                    },
+                )
+            return src_df_edited_local, tgt_df_edited_local
+
+
+        def _apply_editor_updates(src_df_edited: pd.DataFrame, tgt_df_edited: pd.DataFrame) -> None:
+            new_sources_rows = _normalize_order_state(_display_df_to_rows(src_df_edited))
+            new_targets_rows = _normalize_order_state(_display_df_to_rows(tgt_df_edited))
+            prev_state = st.session_state.get(state_key, {})
+            st.session_state[state_key] = {
+                "targets": new_targets_rows,
+                "sources": new_sources_rows,
+                "targets_sig": prev_state.get("targets_sig", tuple(standard_fields)),
+                "sources_sig": prev_state.get("sources_sig", tuple(available_cols)),
+            }
+
+        dialog_decorator = getattr(st, "dialog", None)
+        popover_fn = getattr(st, "popover", None)
+
+        if callable(dialog_decorator):
+            # Streamlit doesn't currently expose dialog width controls; use a minimal CSS override.
+            st.markdown(
+                """
+                <style>
+                /* Widen all Streamlit dialogs (used by mapping UI). */
+                div[data-testid="stDialog"] > div[role="dialog"] {
+                    width: 95vw;
+                    max-width: 1400px;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            @st.dialog(f"{title}字段映射")
+            def _mapping_dialog() -> None:
+                # Fetch latest state (dialog reruns independently).
+                dstate = st.session_state.get(state_key, {})
+                d_targets_rows = list(dstate.get("targets", targets_rows))
+                d_sources_rows = list(dstate.get("sources", sources_rows))
+                st.caption("在对话框中勾选左右列表，并按顺序一一配对。")
+                src_df_edited, tgt_df_edited = _render_editors(d_sources_rows, d_targets_rows)
+                _apply_editor_updates(src_df_edited, tgt_df_edited)
+
+                if st.button("完成并关闭"):
+                    st.rerun()
+
+            if st.button("打开勾选映射（模态对话框）"):
+                _mapping_dialog()
+
+        elif callable(popover_fn):
+            with popover_fn("打开勾选映射（弹出）"):
+                src_df_edited, tgt_df_edited = _render_editors(sources_rows, targets_rows)
+                _apply_editor_updates(src_df_edited, tgt_df_edited)
+
+        else:
+            st.info("当前 Streamlit 版本不支持对话框/弹出控件，将以内嵌方式显示。")
+            src_df_edited, tgt_df_edited = _render_editors(sources_rows, targets_rows)
+            _apply_editor_updates(src_df_edited, tgt_df_edited)
+
+        # Compute mapping from stored state so it still shows after the modal is closed.
+        state_now = st.session_state.get(state_key, {})
+        sources_now = list(state_now.get("sources", sources_rows))
+        targets_now = list(state_now.get("targets", targets_rows))
+
+        sources_selected_sorted = sorted(
+            [r for r in sources_now if r["selected"]],
+            key=lambda r: int(r["order"] or 10**9),
+        )
+        targets_selected_sorted = sorted(
+            [r for r in targets_now if r["selected"]],
+            key=lambda r: int(r["order"] or 10**9),
+        )
+
+        if (
+            sources_selected_sorted
+            and targets_selected_sorted
+            and len(sources_selected_sorted) != len(targets_selected_sorted)
+        ):
+            st.warning(
+                f"源表字段数量({len(sources_selected_sorted)})与规范字段数量({len(targets_selected_sorted)})不一致，将按最短长度配对。"
+            )
+
+        mapping: Dict[str, str] = {}
+        for t, s in zip(targets_selected_sorted, sources_selected_sorted):
+            tgt = str(t.get("field", "")).strip()
+            src = str(s.get("field", "")).strip()
+            if tgt and src:
+                mapping[tgt] = src
+
+        dup_sources = mapping_duplicates(mapping)
+        if dup_sources:
+            st.warning(f"检测到重复映射（多个规范字段指向同一源字段）：{dup_sources}")
+
+        if mapping:
+            preview_rows = [{"规范字段": k, "源表字段": v} for k, v in mapping.items()]
+            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("尚未生成映射：请在左右两侧勾选并调整顺序。")
+
+    return mapping, [], standard_fields
 
 
 def bulk_mapping_ui(
@@ -726,26 +1427,31 @@ def main():
         st.markdown("#### 旺店通发货明细（可选）")
         wdt_items, wdt_cols = file_uploader_multi_block("旺店通发货明细文件", "detail_wdt")
         show_required_fields("旺店通发货明细", "wdt")
-        wdt_mapping, wdt_missing = mapping_ui(
+        wdt_mapping, _, _ = draggable_mapping_ui(
             "旺店通发货明细",
-            REQUIRED_COLUMNS["wdt"],
-            ["预估重量(kg)", "实际重量", "店铺名称"],
-            wdt_cols,
-            "detail_wdt",
+            available_cols=wdt_cols,
+            base_standard_fields=REQUIRED_COLUMNS["wdt"] + ["预估重量(kg)", "实际重量", "店铺名称"],
+            required_cols=REQUIRED_COLUMNS["wdt"],
+            key_prefix="detail_wdt",
             preset=template_data.get("mappings", {}).get("detail_wdt")
             or template_data.get("mappings", {}).get("detail"),
         )
+        wdt_missing = required_mapping_missing(effective_required_cols("detail_wdt", REQUIRED_COLUMNS["wdt"]), wdt_mapping)
 
         st.markdown("#### 云宝发货明细（可选）")
         yubao_items, yubao_cols = file_uploader_multi_block("云宝发货明细文件", "detail_yubao")
         show_required_fields("云宝发货明细", "yubao")
-        yubao_detail_mapping, yubao_detail_missing = mapping_ui(
+        yubao_detail_mapping, _, _ = draggable_mapping_ui(
             "云宝发货明细",
-            REQUIRED_COLUMNS["yubao"],
-            ["预估重量(kg)", "实际重量", "店铺名称"],
-            yubao_cols,
-            "detail_yubao",
+            available_cols=yubao_cols,
+            base_standard_fields=REQUIRED_COLUMNS["yubao"] + ["预估重量(kg)", "实际重量", "店铺名称"],
+            required_cols=REQUIRED_COLUMNS["yubao"],
+            key_prefix="detail_yubao",
             preset=template_data.get("mappings", {}).get("detail_yubao"),
+        )
+        yubao_detail_missing = required_mapping_missing(
+            effective_required_cols("detail_yubao", REQUIRED_COLUMNS["yubao"]),
+            yubao_detail_mapping,
         )
 
         yubao_map_items: List[ExcelSheetItem] = []
@@ -754,92 +1460,112 @@ def main():
             st.subheader("2. 云宝名称货品表（云宝明细必填）")
             yubao_map_items, yubao_map_cols = file_uploader_block("云宝名称货品表", "yubao_map")
             show_required_fields("云宝名称货品表", "yubao_map")
-            yubao_mapping, yubao_missing = mapping_ui(
+            yubao_mapping, _, _ = draggable_mapping_ui(
                 "云宝名称货品表",
-                REQUIRED_COLUMNS["yubao_map"],
-                [],
-                yubao_map_cols,
-                "yubao_map",
+                available_cols=yubao_map_cols,
+                base_standard_fields=REQUIRED_COLUMNS["yubao_map"],
+                required_cols=REQUIRED_COLUMNS["yubao_map"],
+                key_prefix="yubao_map",
                 preset=template_data.get("mappings", {}).get("yubao_map"),
+            )
+            yubao_missing = required_mapping_missing(
+                effective_required_cols("yubao_map", REQUIRED_COLUMNS["yubao_map"]),
+                yubao_mapping,
             )
 
         st.subheader("3. 毛重表")
         maozhong_items, maozhong_cols = file_uploader_block("毛重表", "maozhong")
         show_required_fields("毛重表", "maozhong")
-        maozhong_mapping, maozhong_missing = mapping_ui(
+        maozhong_mapping, _, _ = draggable_mapping_ui(
             "毛重表",
-            REQUIRED_COLUMNS["maozhong"],
-            [],
-            maozhong_cols,
-            "maozhong",
+            available_cols=maozhong_cols,
+            base_standard_fields=REQUIRED_COLUMNS["maozhong"],
+            required_cols=REQUIRED_COLUMNS["maozhong"],
+            key_prefix="maozhong",
             preset=template_data.get("mappings", {}).get("maozhong"),
+        )
+        maozhong_missing = required_mapping_missing(
+            effective_required_cols("maozhong", REQUIRED_COLUMNS["maozhong"]),
+            maozhong_mapping,
         )
 
         st.subheader("4. 重量段定义表")
         weight_items, weight_cols = file_uploader_block("重量段定义表", "weight_segments")
         show_required_fields("重量段定义表", "weight_segments")
-        weight_mapping, weight_missing = mapping_ui(
+        weight_mapping, _, _ = draggable_mapping_ui(
             "重量段定义表",
-            REQUIRED_COLUMNS["weight_segments"],
-            [],
-            weight_cols,
-            "weight_segments",
+            available_cols=weight_cols,
+            base_standard_fields=REQUIRED_COLUMNS["weight_segments"],
+            required_cols=REQUIRED_COLUMNS["weight_segments"],
+            key_prefix="weight_segments",
             preset=template_data.get("mappings", {}).get("weight_segments"),
+        )
+        weight_missing = required_mapping_missing(
+            effective_required_cols("weight_segments", REQUIRED_COLUMNS["weight_segments"]),
+            weight_mapping,
         )
 
         st.subheader("5. 多条件资费表")
         tariff_items, tariff_cols = file_uploader_block("多条件资费表", "tariff")
         show_required_fields("多条件资费表", "tariff")
-        tariff_mapping, tariff_missing = mapping_ui(
+        tariff_mapping, _, _ = draggable_mapping_ui(
             "多条件资费表",
-            REQUIRED_COLUMNS["tariff"],
-            [],
-            tariff_cols,
-            "tariff",
+            available_cols=tariff_cols,
+            base_standard_fields=REQUIRED_COLUMNS["tariff"],
+            required_cols=REQUIRED_COLUMNS["tariff"],
+            key_prefix="tariff",
             preset=template_data.get("mappings", {}).get("tariff"),
+        )
+        tariff_missing = required_mapping_missing(
+            effective_required_cols("tariff", REQUIRED_COLUMNS["tariff"]),
+            tariff_mapping,
         )
 
         st.subheader("6. 辅助数据源")
         consumable_items, consumable_cols = file_uploader_block("耗材表（可选）", "consumables")
-        consumable_mapping, _ = mapping_ui(
+        consumable_mapping, _, _ = draggable_mapping_ui(
             "耗材表",
-            [],
-            REQUIRED_COLUMNS["consumables"],
-            consumable_cols,
-            "consumables",
+            available_cols=consumable_cols,
+            base_standard_fields=REQUIRED_COLUMNS["consumables"],
+            required_cols=REQUIRED_COLUMNS["consumables"],
+            key_prefix="consumables",
             preset=template_data.get("mappings", {}).get("consumables"),
         )
 
         tear_items, tear_cols = file_uploader_block("撕单表（可选）", "tear")
-        tear_mapping, _ = mapping_ui(
+        tear_mapping, _, _ = draggable_mapping_ui(
             "撕单表",
-            REQUIRED_COLUMNS["tear"],
-            [],
-            tear_cols,
-            "tear",
+            available_cols=tear_cols,
+            base_standard_fields=REQUIRED_COLUMNS["tear"],
+            required_cols=REQUIRED_COLUMNS["tear"],
+            key_prefix="tear",
             preset=template_data.get("mappings", {}).get("tear"),
         )
 
         after_items, after_cols = file_uploader_block("售后赔付表（可选）", "aftersale")
-        after_mapping, _ = mapping_ui(
+        after_mapping, _, _ = draggable_mapping_ui(
             "售后赔付表",
-            REQUIRED_COLUMNS["aftersale"],
-            [],
-            after_cols,
-            "aftersale",
+            available_cols=after_cols,
+            base_standard_fields=REQUIRED_COLUMNS["aftersale"],
+            required_cols=REQUIRED_COLUMNS["aftersale"],
+            key_prefix="aftersale",
             preset=template_data.get("mappings", {}).get("aftersale"),
         )
 
         st.subheader("7. 云仓账单（支持多文件汇总）")
         bill_items, bill_cols = file_uploader_multi_block("云仓账单文件", "bill")
         show_required_fields("云仓账单", "bill")
-        bill_mapping, bill_missing = mapping_ui(
+        bill_mapping, _, _ = draggable_mapping_ui(
             "云仓账单",
-            REQUIRED_COLUMNS["bill"],
-            ["包装费(元)"],
-            bill_cols,
-            "bill",
+            available_cols=bill_cols,
+            base_standard_fields=REQUIRED_COLUMNS["bill"] + ["包装费(元)"],
+            required_cols=REQUIRED_COLUMNS["bill"],
+            key_prefix="bill",
             preset=template_data.get("mappings", {}).get("bill"),
+        )
+        bill_missing = required_mapping_missing(
+            effective_required_cols("bill", REQUIRED_COLUMNS["bill"]),
+            bill_mapping,
         )
 
         template_payload = build_template(
@@ -952,6 +1678,8 @@ def main():
             need_maozhong = has_detail and (
                 (weight_source == WEIGHT_SOURCE_MAOZHONG_CALC) or (pack_rule == PACK_RULE_MATCH)
             )
+            need_consumables = bool(consumable_items) and enable_consumables
+            need_deductions = enable_deductions
             missing_files = []
             if not bill_items:
                 missing_files.append("云仓账单")
@@ -969,6 +1697,7 @@ def main():
                 st.error(f"缺少必选文件：{'、'.join(missing_files)}")
                 return
 
+            # Required mapping validation (bulk mapping).
             mapping_missing = bill_missing
             if has_detail:
                 if need_maozhong:
@@ -978,6 +1707,25 @@ def main():
                     mapping_missing += wdt_missing
                 if yubao_items:
                     mapping_missing += yubao_detail_missing + yubao_missing
+
+            # Optional tables become required only when the feature is enabled.
+            if need_consumables:
+                mapping_missing += required_mapping_missing(
+                    effective_required_cols("consumables", REQUIRED_COLUMNS["consumables"]),
+                    consumable_mapping,
+                )
+            if need_deductions:
+                if tear_items:
+                    mapping_missing += required_mapping_missing(
+                        effective_required_cols("tear", REQUIRED_COLUMNS["tear"]),
+                        tear_mapping,
+                    )
+                if after_items:
+                    mapping_missing += required_mapping_missing(
+                        effective_required_cols("aftersale", REQUIRED_COLUMNS["aftersale"]),
+                        after_mapping,
+                    )
+
             if mapping_missing:
                 st.error(f"请完成必填字段映射：{'、'.join(sorted(set(mapping_missing)))}")
                 return
@@ -997,6 +1745,14 @@ def main():
                 if yubao_items:
                     mapping_sets.append(("云宝发货明细", yubao_detail_mapping))
                     mapping_sets.append(("云宝名称货品表", yubao_mapping))
+
+            if need_consumables:
+                mapping_sets.append(("耗材表", consumable_mapping))
+            if need_deductions:
+                if tear_items:
+                    mapping_sets.append(("撕单表", tear_mapping))
+                if after_items:
+                    mapping_sets.append(("售后赔付表", after_mapping))
 
             # If using detail-estimated weight, inject the selected source column into mappings.
             # This ensures usecols + rename produce standard field '预估重量(kg)' for downstream logic.
@@ -1054,20 +1810,32 @@ def main():
                     mapping=yubao_mapping,
                     title="云宝名称货品表",
                 )
-                consumable_df = read_and_map_multi_with_progress(
-                    items=consumable_items,
-                    mapping=consumable_mapping,
-                    title="耗材表",
+                consumable_df = (
+                    read_and_map_multi_with_progress(
+                        items=consumable_items,
+                        mapping=consumable_mapping,
+                        title="耗材表",
+                    )
+                    if need_consumables
+                    else None
                 )
-                tear_df = read_and_map_multi_with_progress(
-                    items=tear_items,
-                    mapping=tear_mapping,
-                    title="撕单表",
+                tear_df = (
+                    read_and_map_multi_with_progress(
+                        items=tear_items,
+                        mapping=tear_mapping,
+                        title="撕单表",
+                    )
+                    if need_deductions
+                    else None
                 )
-                after_df = read_and_map_multi_with_progress(
-                    items=after_items,
-                    mapping=after_mapping,
-                    title="售后赔付表",
+                after_df = (
+                    read_and_map_multi_with_progress(
+                        items=after_items,
+                        mapping=after_mapping,
+                        title="售后赔付表",
+                    )
+                    if need_deductions
+                    else None
                 )
 
             if bill_df is None or bill_df.empty:

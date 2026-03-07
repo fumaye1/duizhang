@@ -1,0 +1,14 @@
+# Streamlit server configuration
+#
+# NOTE: Disabling XSRF/CORS lowers security. This tool is intended for
+# trusted/internal environments where the app may be accessed via IP/External URL
+# or embedded browsers (which often block cookies), causing upload 403 errors.
+
+[server]
+# Avoid 403 on upload when cookies/origin headers are not preserved.
+enableXsrfProtection = false
+# Allow access from different origins (e.g., External URL / embedded browser).
+enableCORS = false
+
+# (Optional) If your Excel files are large, you can raise this (MB):
+# maxUploadSize = 200

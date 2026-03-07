@@ -2,5 +2,6 @@ pandas
 openpyxl
 numpy
 streamlit
+streamlit-sortables
 requests
 xlrd>=2.0.1
