@@ -10,6 +10,12 @@ import streamlit as st
 from reconcile import (
     REQUIRED_COLUMNS,
     ReconcileConfig,
+    WEIGHT_SOURCE_DETAIL_ESTIMATED,
+    WEIGHT_SOURCE_MAOZHONG_CALC,
+    PACK_RULE_FIXED_NON_PACKED,
+    PACK_RULE_FIXED_PACKED,
+    PACK_RULE_IGNORE,
+    PACK_RULE_MATCH,
     build_sku_mapping,
     map_yubao_sku,
     reconcile_main,
@@ -723,7 +729,7 @@ def main():
         wdt_mapping, wdt_missing = mapping_ui(
             "旺店通发货明细",
             REQUIRED_COLUMNS["wdt"],
-            ["实际重量", "店铺名称"],
+            ["预估重量(kg)", "实际重量", "店铺名称"],
             wdt_cols,
             "detail_wdt",
             preset=template_data.get("mappings", {}).get("detail_wdt")
@@ -736,7 +742,7 @@ def main():
         yubao_detail_mapping, yubao_detail_missing = mapping_ui(
             "云宝发货明细",
             REQUIRED_COLUMNS["yubao"],
-            ["实际重量", "店铺名称"],
+            ["预估重量(kg)", "实际重量", "店铺名称"],
             yubao_cols,
             "detail_yubao",
             preset=template_data.get("mappings", {}).get("detail_yubao"),
@@ -863,7 +869,78 @@ def main():
 
         st.subheader("8. 对账参数")
         yuncang = st.text_input("云仓名称", value="华东仓")
-        use_actual_weight = st.checkbox("优先使用实际重量（若存在）", value=True)
+
+        weight_source_label = st.radio(
+            "重量来源",
+            options=[
+                "使用毛重表核算重量（kg）",
+                "使用发货明细预估重量（kg）",
+            ],
+            index=0,
+            help=(
+                "毛重表核算重量：按 数量×毛重(g)/1000 计算；\n"
+                "发货明细预估重量：使用明细中的‘预估重量(kg)’（需在字段映射里选择/映射）。"
+            ),
+        )
+        weight_source = (
+            WEIGHT_SOURCE_MAOZHONG_CALC
+            if weight_source_label.startswith("使用毛重表")
+            else WEIGHT_SOURCE_DETAIL_ESTIMATED
+        )
+
+        wdt_estimated_weight_col: Optional[str] = None
+        yubao_estimated_weight_col: Optional[str] = None
+        if weight_source == WEIGHT_SOURCE_DETAIL_ESTIMATED:
+            st.markdown("**发货明细预估重量列选择**")
+            st.caption("启用‘使用发货明细预估重量’时，需要从发货明细表头中选择一列作为预估重量(kg)。")
+
+            if wdt_items and wdt_cols:
+                options = ["--请选择--"] + list(wdt_cols)
+                preset_value = (wdt_mapping or {}).get("预估重量(kg)")
+                default_index = options.index(preset_value) if preset_value in options else 0
+                wdt_estimated_weight_col = st.selectbox(
+                    "旺店通发货明细：预估重量列（kg）",
+                    options=options,
+                    index=default_index,
+                    key="wdt_estimated_weight_col",
+                )
+
+            if yubao_items and yubao_cols:
+                options = ["--请选择--"] + list(yubao_cols)
+                preset_value = (yubao_detail_mapping or {}).get("预估重量(kg)")
+                default_index = options.index(preset_value) if preset_value in options else 0
+                yubao_estimated_weight_col = st.selectbox(
+                    "云宝发货明细：预估重量列（kg）",
+                    options=options,
+                    index=default_index,
+                    key="yubao_estimated_weight_col",
+                )
+
+        match_packed = st.checkbox(
+            "按是否打包品匹配资费",
+            value=True,
+            help="勾选后会根据毛重表‘箱规’判断每行是否为打包品；不勾选则使用默认值或忽略该条件。",
+        )
+        if match_packed:
+            pack_rule = PACK_RULE_MATCH
+            st.caption("已启用打包品判断：需要上传毛重表（含箱规）。")
+        else:
+            packed_default = st.radio(
+                "未启用打包品匹配时：默认按哪种口径计算？",
+                options=[
+                    "默认打包品",
+                    "默认非打包品",
+                    "不限（忽略是否打包品条件）",
+                ],
+                index=2,
+            )
+            if packed_default == "默认打包品":
+                pack_rule = PACK_RULE_FIXED_PACKED
+            elif packed_default == "默认非打包品":
+                pack_rule = PACK_RULE_FIXED_NON_PACKED
+            else:
+                pack_rule = PACK_RULE_IGNORE
+
         enable_deductions = st.checkbox("启用撕单/售后扣款", value=True)
         enable_consumables = st.checkbox("启用耗材计算", value=False)
 
@@ -871,11 +948,15 @@ def main():
 
         if st.button("开始对账", type="primary"):
             has_detail = bool(wdt_items) or bool(yubao_items)
+
+            need_maozhong = has_detail and (
+                (weight_source == WEIGHT_SOURCE_MAOZHONG_CALC) or (pack_rule == PACK_RULE_MATCH)
+            )
             missing_files = []
             if not bill_items:
                 missing_files.append("云仓账单")
             if has_detail:
-                if not maozhong_items:
+                if need_maozhong and (not maozhong_items):
                     missing_files.append("毛重表")
                 if not weight_items:
                     missing_files.append("重量段定义表")
@@ -890,7 +971,9 @@ def main():
 
             mapping_missing = bill_missing
             if has_detail:
-                mapping_missing += maozhong_missing + weight_missing + tariff_missing
+                if need_maozhong:
+                    mapping_missing += maozhong_missing
+                mapping_missing += weight_missing + tariff_missing
                 if wdt_items:
                     mapping_missing += wdt_missing
                 if yubao_items:
@@ -904,15 +987,30 @@ def main():
             ]
             if has_detail:
                 mapping_sets += [
-                    ("毛重表", maozhong_mapping),
                     ("重量段定义表", weight_mapping),
                     ("多条件资费表", tariff_mapping),
                 ]
+                if need_maozhong:
+                    mapping_sets.append(("毛重表", maozhong_mapping))
                 if wdt_items:
                     mapping_sets.append(("旺店通发货明细", wdt_mapping))
                 if yubao_items:
                     mapping_sets.append(("云宝发货明细", yubao_detail_mapping))
                     mapping_sets.append(("云宝名称货品表", yubao_mapping))
+
+            # If using detail-estimated weight, inject the selected source column into mappings.
+            # This ensures usecols + rename produce standard field '预估重量(kg)' for downstream logic.
+            if has_detail and weight_source == WEIGHT_SOURCE_DETAIL_ESTIMATED:
+                if wdt_items:
+                    if not wdt_estimated_weight_col or wdt_estimated_weight_col == "--请选择--":
+                        st.error("已选择‘使用发货明细预估重量’，请为【旺店通发货明细】选择预估重量列")
+                        return
+                    wdt_mapping["预估重量(kg)"] = wdt_estimated_weight_col
+                if yubao_items:
+                    if not yubao_estimated_weight_col or yubao_estimated_weight_col == "--请选择--":
+                        st.error("已选择‘使用发货明细预估重量’，请为【云宝发货明细】选择预估重量列")
+                        return
+                    yubao_detail_mapping["预估重量(kg)"] = yubao_estimated_weight_col
 
             for title, mapping in mapping_sets:
                 duplicates = mapping_duplicates(mapping)
@@ -999,10 +1097,11 @@ def main():
             if has_detail:
                 if detail_df is None or detail_df.empty:
                     missing.append("发货明细")
-                if maozhong_df is None:
-                    missing += REQUIRED_COLUMNS["maozhong"]
-                else:
-                    missing += validate_columns(maozhong_df, REQUIRED_COLUMNS["maozhong"])
+                if need_maozhong:
+                    if maozhong_df is None:
+                        missing += REQUIRED_COLUMNS["maozhong"]
+                    else:
+                        missing += validate_columns(maozhong_df, REQUIRED_COLUMNS["maozhong"])
                 if weight_df is None:
                     missing += REQUIRED_COLUMNS["weight_segments"]
                 else:
@@ -1025,11 +1124,20 @@ def main():
             config = ReconcileConfig(
                 yuncang=yuncang,
                 erp_type="wdt",
-                use_actual_weight=use_actual_weight,
+                weight_source=weight_source,
+                pack_rule=pack_rule,
                 enable_deductions=enable_deductions,
                 enable_consumables=enable_consumables,
                 clean_province=clean_province,
             )
+
+            if has_detail and weight_source == WEIGHT_SOURCE_DETAIL_ESTIMATED:
+                if detail_df is None or detail_df.empty:
+                    st.error("选择了发货明细预估重量，但发货明细为空")
+                    return
+                if "预估重量(kg)" not in detail_df.columns:
+                    st.error("选择了发货明细预估重量，但明细中未生成规范字段：预估重量(kg)。请在参数区选择预估重量列，或在字段映射中映射到‘预估重量(kg)’")
+                    return
 
             with st.spinner("正在对账计算..."):
                 result_df, summary_df, exception_df = reconcile_main(

@@ -11,10 +11,20 @@ import pandas as pd
 class ReconcileConfig:
     yuncang: str
     erp_type: str
-    use_actual_weight: bool
+    weight_source: str
+    pack_rule: str
     enable_deductions: bool
     enable_consumables: bool
     clean_province: bool
+
+
+WEIGHT_SOURCE_DETAIL_ESTIMATED = "detail_estimated"
+WEIGHT_SOURCE_MAOZHONG_CALC = "maozhong_calc"
+
+PACK_RULE_MATCH = "match"
+PACK_RULE_FIXED_PACKED = "fixed_packed"
+PACK_RULE_FIXED_NON_PACKED = "fixed_non_packed"
+PACK_RULE_IGNORE = "ignore"
 
 
 REQUIRED_COLUMNS = {
@@ -124,27 +134,61 @@ def compute_maozhong_lookup(df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     return lookup
 
 
+def _get_detail_estimated_weight_kg(detail_df: pd.DataFrame) -> pd.Series:
+    """Return estimated weight series in kg from shipping detail.
+
+    Supported columns (after mapping):
+    - 预估重量(kg)
+    - 预估重量
+    """
+
+    for col in ["预估重量(kg)", "预估重量"]:
+        if col in detail_df.columns:
+            return ensure_numeric(detail_df[col])
+    raise ValueError("选择了‘发货明细预估重量’，但明细中缺少列：预估重量(kg) 或 预估重量")
+
+
 def compute_order_weights(
     detail_df: pd.DataFrame,
     maozhong_lookup: Dict[str, Dict[str, float]],
-    use_actual_weight: bool,
+    weight_source: str,
+    pack_rule: str,
 ) -> pd.DataFrame:
     df = detail_df.copy()
     df["数量"] = ensure_numeric(df["数量"]).fillna(0)
-    df["毛重(g)"] = df["商家编码"].map(lambda x: maozhong_lookup.get(str(x), {}).get("毛重(g)", np.nan))
-    df["箱规"] = df["商家编码"].map(lambda x: maozhong_lookup.get(str(x), {}).get("箱规", np.nan))
 
-    df["预估重量(kg)"] = df["数量"] * df["毛重(g)"] / 1000
-
-    if use_actual_weight and "实际重量" in df.columns:
-        df["实际重量"] = ensure_numeric(df["实际重量"]).fillna(0)
-        df["计费重量原始"] = df[["实际重量", "预估重量(kg)"]].max(axis=1)
+    need_maozhong_fields = (weight_source == WEIGHT_SOURCE_MAOZHONG_CALC) or (pack_rule == PACK_RULE_MATCH)
+    if need_maozhong_fields:
+        df["毛重(g)"] = df["商家编码"].map(
+            lambda x: maozhong_lookup.get(str(x), {}).get("毛重(g)", np.nan)
+        )
+        df["箱规"] = df["商家编码"].map(
+            lambda x: maozhong_lookup.get(str(x), {}).get("箱规", np.nan)
+        )
     else:
-        df["计费重量原始"] = df["预估重量(kg)"]
+        df["毛重(g)"] = np.nan
+        df["箱规"] = np.nan
 
-    df["是否打包品"] = df.apply(
-        lambda row: is_packed_order(row.get("数量"), row.get("箱规")), axis=1
-    )
+    if weight_source == WEIGHT_SOURCE_DETAIL_ESTIMATED:
+        df["计费重量原始"] = _get_detail_estimated_weight_kg(df)
+    elif weight_source == WEIGHT_SOURCE_MAOZHONG_CALC:
+        df["计费重量原始"] = df["数量"] * ensure_numeric(df["毛重(g)"]) / 1000
+    else:
+        raise ValueError(f"未知 weight_source：{weight_source}")
+
+    if pack_rule == PACK_RULE_MATCH:
+        df["是否打包品"] = df.apply(
+            lambda row: is_packed_order(row.get("数量"), row.get("箱规")), axis=1
+        )
+    elif pack_rule == PACK_RULE_FIXED_PACKED:
+        df["是否打包品"] = "打包品"
+    elif pack_rule == PACK_RULE_FIXED_NON_PACKED:
+        df["是否打包品"] = "非打包品"
+    elif pack_rule == PACK_RULE_IGNORE:
+        df["是否打包品"] = ""
+    else:
+        raise ValueError(f"未知 pack_rule：{pack_rule}")
+
     return df
 
 
@@ -206,7 +250,12 @@ def _coerce_tariff_schema(tariff_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def match_tariff(order: pd.Series, tariff_df: pd.DataFrame) -> Optional[pd.Series]:
+def match_tariff(
+    order: pd.Series,
+    tariff_df: pd.DataFrame,
+    *,
+    match_packed: bool,
+) -> Optional[pd.Series]:
     """Match tariff by (云仓/快递/是否打包品/省份/生效期) and weight rule.
 
     Weight logic:
@@ -217,20 +266,29 @@ def match_tariff(order: pd.Series, tariff_df: pd.DataFrame) -> Optional[pd.Serie
     df = tariff_df
     w = float(order.get("结算重量(取整)") or 0)
 
-    candidates = df[
+    base_mask = (
         (df["云仓"] == order["云仓"])
         & (df["快递公司"] == order["快递公司"])
         & ((df["省份"] == order["收货省份"]) | (df["省份"] == "*"))
-        & ((df["是否打包品"] == order["是否打包品"]) | (df["是否打包品"] == "全包"))
         & (df["生效开始日期"] <= order["发货时间"])
         & (df["生效结束日期"] >= order["发货时间"])
-    ].copy()
+    )
+
+    if match_packed:
+        base_mask = base_mask & (
+            (df["是否打包品"] == order["是否打包品"]) | (df["是否打包品"] == "全包")
+        )
+
+    candidates = df[base_mask].copy()
 
     if candidates.empty:
         return None
 
     candidates["_province_exact"] = candidates["省份"] == order["收货省份"]
-    candidates["_pack_exact"] = candidates["是否打包品"] == order["是否打包品"]
+    if match_packed:
+        candidates["_pack_exact"] = candidates["是否打包品"] == order["是否打包品"]
+    else:
+        candidates["_pack_exact"] = False
     candidates["_weight_end"] = ensure_numeric(candidates["重量段结束(kg)"]).fillna(0)
 
     # Try covered segment first (weight_end > 0 and >= w).
@@ -405,8 +463,12 @@ def reconcile_main(
         summary_df = summarize_by(["云仓", "快递公司"], result_df)
         return result_df, summary_df, exception_df
 
-    if maozhong_df is None or weight_segments_df is None or tariff_df is None:
-        raise ValueError("存在发货明细时，毛重表/重量段定义表/资费表为必填")
+    if weight_segments_df is None or tariff_df is None:
+        raise ValueError("存在发货明细时，重量段定义表/资费表为必填")
+
+    need_maozhong = (config.weight_source == WEIGHT_SOURCE_MAOZHONG_CALC) or (config.pack_rule == PACK_RULE_MATCH)
+    if need_maozhong and (maozhong_df is None or maozhong_df.empty):
+        raise ValueError("当前参数需要毛重表（用于重量核算或打包品判断），但毛重表为空")
 
     df = detail_df.copy()
     df["发货时间"] = safe_to_datetime(df["发货时间"])
@@ -421,8 +483,13 @@ def reconcile_main(
     if config.clean_province:
         df["收货省份"] = df["收货省份"].map(normalize_province)
 
-    maozhong_lookup = compute_maozhong_lookup(maozhong_df)
-    df = compute_order_weights(df, maozhong_lookup, config.use_actual_weight)
+    maozhong_lookup = compute_maozhong_lookup(maozhong_df) if need_maozhong and maozhong_df is not None else {}
+    df = compute_order_weights(
+        df,
+        maozhong_lookup,
+        config.weight_source,
+        config.pack_rule,
+    )
     df["云仓"] = config.yuncang
 
     df["结算重量(取整)"] = df["计费重量原始"].apply(
@@ -437,7 +504,7 @@ def reconcile_main(
     results = []
     notes = []
     for _, row in df.iterrows():
-        matched = match_tariff(row, tariff_df)
+        matched = match_tariff(row, tariff_df, match_packed=(config.pack_rule != PACK_RULE_IGNORE))
         fee, note = calculate_tariff_fee(row, matched)
         results.append(fee)
         notes.append(note)
